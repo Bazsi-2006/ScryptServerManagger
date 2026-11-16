@@ -123,8 +123,15 @@ type paneInfo struct {
 	ident  string
 }
 
+// windowTarget addresses the configured window (all of its panes).
+func (b *tmuxBackend) windowTarget() string { return "=" + b.t.Session + ":" + b.t.Window }
+
+// paneInfo looks up the configured pane. It uses list-panes because, unlike
+// `display-message -p`, that command fails when the target does not exist
+// instead of printing empty values.
 func (b *tmuxBackend) paneInfo(ctx context.Context) (paneInfo, error) {
-	res, err := b.tmux(ctx, "display-message", "-p", "-t", b.paneTarget(), "#{pane_pipe} #{pane_dead} #{pane_id}/#{session_created}")
+	res, err := b.tmux(ctx, "list-panes", "-t", b.windowTarget(), "-F",
+		"#{pane_index} #{pane_active} #{pane_pipe} #{pane_dead} #{pane_id}/#{session_created}")
 	if err != nil {
 		return paneInfo{}, err
 	}
@@ -134,11 +141,17 @@ func (b *tmuxBackend) paneInfo(ctx context.Context) (paneInfo, error) {
 		}
 		return paneInfo{}, fmt.Errorf("tmux: %s", res.stderr)
 	}
-	f := strings.Fields(res.stdout)
-	if len(f) != 3 {
-		return paneInfo{}, fmt.Errorf("tmux: unexpected reply %q", strings.TrimSpace(res.stdout))
+	for _, line := range strings.Split(strings.TrimSpace(res.stdout), "\n") {
+		f := strings.Fields(line)
+		if len(f) != 5 {
+			continue
+		}
+		// The configured pane index, or the window's active pane.
+		if (b.t.Pane != "" && f[0] == b.t.Pane) || (b.t.Pane == "" && f[1] == "1") {
+			return paneInfo{exists: true, piped: f[2] == "1", dead: f[3] == "1", ident: f[4]}, nil
+		}
 	}
-	return paneInfo{exists: true, piped: f[0] == "1", dead: f[1] == "1", ident: f[2]}, nil
+	return paneInfo{}, nil
 }
 
 func (b *tmuxBackend) Probe(ctx context.Context) Probe {

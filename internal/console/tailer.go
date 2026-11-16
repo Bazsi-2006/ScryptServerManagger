@@ -12,6 +12,11 @@ import (
 // Tailer follows a growing file by polling and feeds new bytes through a
 // Sanitizer. It copes with truncation and rotation (rename + recreate) and
 // can optionally keep application-owned capture files bounded.
+//
+// Truncation is recognised by the file becoming shorter than the read
+// position. Like tail(1), it cannot notice a file that is truncated and then
+// rewritten beyond the old position within a single poll interval; rotation
+// by rename is detected reliably through the inode.
 type Tailer struct {
 	Path string
 	// MaxBytes > 0 lets the tailer truncate the file once it has been fully

@@ -28,6 +28,7 @@ type result struct {
 	message string // status message for that state
 	status  string // operation outcome
 	note    string // outcome description (error text or remark)
+	unready bool   // the start did not reach readiness (process may be alive)
 }
 
 func ok(state State, note string) result {
@@ -123,6 +124,9 @@ func (s *server) end(op *operation, r result) {
 		s.op = nil
 	}
 	info := op.info
+	if info.Type != OpBackup {
+		s.unready = r.unready
+	}
 	if r.state != "" && (s.state != r.state || s.message != r.message) {
 		s.setLocked(r.state, r.message)
 	} else {
@@ -394,7 +398,9 @@ func (s *server) awaitReady(ctx context.Context, op *operation, def *servers.Def
 			if pre, _, intr := s.opFlags(op); pre || intr {
 				return s.aborted(pre)
 			}
-			return failed(Error, fmt.Sprintf("startup timed out after %s: %s", timeout, reason))
+			r := failed(Error, fmt.Sprintf("startup timed out after %s: %s", timeout, reason))
+			r.unready = true
+			return r
 		case <-matched:
 			isMatched = true
 			matched = nil

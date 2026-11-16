@@ -51,6 +51,11 @@ type server struct {
 	op      *operation
 	deleted bool
 	follow  *follower
+	// unready is set when a start failed to reach readiness while the
+	// process stayed alive. Until the next operation (or the process dying),
+	// only a verifiable check (port/script) may promote it to RUNNING;
+	// console/none readiness cannot be re-evaluated and must not be assumed.
+	unready bool
 }
 
 func newServer(m *Manager, def *servers.Definition) *server {
@@ -242,6 +247,11 @@ func checkReady(ctx context.Context, def *servers.Definition) (bool, error) {
 	return true, nil
 }
 
+// verifiable reports whether readiness can be checked at any time.
+func verifiable(def *servers.Definition) bool {
+	return def.Readiness.Method == servers.ReadyPort || def.Readiness.Method == servers.ReadyScript
+}
+
 // resolve turns a backend probe into alive/dead/unknown. Backends without a
 // native lifecycle signal (LifeExternal) are judged by the configured
 // external check; external reports whether that happened.
@@ -304,6 +314,7 @@ func (s *server) observe() {
 	case lifeUnknown:
 		s.setLocked(Unknown, detail)
 	case lifeDead:
+		s.unready = false
 		switch {
 		case p.Phase == backend.PhaseFailed && s.state != Stopped && s.state != Error:
 			s.setLocked(Error, firstNonEmpty(detail, "the server failed"))
@@ -328,7 +339,8 @@ func (s *server) observe() {
 			}
 		case s.state == Running:
 			s.setLocked(Running, detail)
-		case ready:
+		case ready && !(s.unready && !verifiable(def)):
+			s.unready = false
 			s.setLocked(Running, detail)
 		case s.state == Error:
 			// A failed start whose process lingers stays ERROR until it
