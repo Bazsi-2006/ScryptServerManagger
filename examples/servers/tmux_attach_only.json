@@ -1,0 +1,14 @@
+{
+  "id": "tmux_attach_only",
+  "name": "Existing tmux session",
+  "description": "A session that is started elsewhere. The manager watches it, streams its output, sends commands and can stop it, but cannot start it.",
+  "category": "Examples",
+  "backend": "tmux",
+  "tmux": {
+    "session": "terraria",
+    "window": "0",
+    "pane": "0",
+    "stop_text": "exit"
+  },
+  "timeouts": { "stop": "45s" }
+}

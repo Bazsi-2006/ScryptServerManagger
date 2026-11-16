@@ -1,0 +1,108 @@
+{
+  "mode": "production",
+  "listen": "127.0.0.1:8080",
+  "public_url": "https://servers.example.com",
+  "trusted_proxies": [
+    "127.0.0.1/32",
+    "::1/128"
+  ],
+  "paths": {
+    "data_dir": "/var/lib/server-manager",
+    "database": "/var/lib/server-manager/server-manager.db",
+    "servers_dir": "/etc/server-manager/servers",
+    "log_dir": "/var/log/server-manager",
+    "secrets_dir": "/var/lib/server-manager/secrets",
+    "runtime_dir": "/var/lib/server-manager/runtime"
+  },
+  "auth": {
+    "access_token_ttl": "10m0s",
+    "refresh_token_ttl": "720h0m0s",
+    "invitation_ttl": "72h0m0s",
+    "email_change_ttl": "24h0m0s",
+    "min_password_length": 10,
+    "cookie_secure": "auto",
+    "jwt_secret_file": "/var/lib/server-manager/secrets/jwt.key",
+    "argon2": {
+      "memory_kib": 65536,
+      "iterations": 3,
+      "parallelism": 2
+    }
+  },
+  "smtp": {
+    "host": "smtp.example.com",
+    "port": 587,
+    "username": "server-manager@example.com",
+    "password_file": "",
+    "from": "Server Manager <server-manager@example.com>",
+    "tls": "starttls"
+  },
+  "cors": {
+    "allowed_origins": null
+  },
+  "rate_limits": {
+    "login": {
+      "requests": 5,
+      "window": "1m0s"
+    },
+    "refresh": {
+      "requests": 30,
+      "window": "1m0s"
+    },
+    "api": {
+      "requests": 600,
+      "window": "1m0s"
+    },
+    "server_start": {
+      "requests": 6,
+      "window": "1m0s"
+    },
+    "server_stop": {
+      "requests": 6,
+      "window": "1m0s"
+    },
+    "console_command": {
+      "requests": 60,
+      "window": "1m0s"
+    },
+    "backup_create": {
+      "requests": 3,
+      "window": "5m0s"
+    },
+    "server_cooldown": "3s"
+  },
+  "monitoring": {
+    "host_metrics_interval": "5s",
+    "host_metrics_for_users": true,
+    "status_poll_interval": "5s"
+  },
+  "console": {
+    "buffer_lines": 2000,
+    "max_line_bytes": 4096,
+    "snapshot_lines": 300,
+    "max_command_length": 1024,
+    "max_log_file_bytes": 16777216
+  },
+  "backups": {
+    "max_download_bytes": 0,
+    "max_concurrent_downloads": 4
+  },
+  "logging": {
+    "level": "info",
+    "format": "text",
+    "file": ""
+  },
+  "audit": {
+    "retention_days": 0
+  },
+  "security": {
+    "config_permission_full_access": false,
+    "max_request_bytes": 1048576
+  },
+  "tools": {
+    "tmux": "tmux",
+    "systemctl": "systemctl",
+    "journalctl": "journalctl",
+    "sudo": "sudo",
+    "docker_socket": "/var/run/docker.sock"
+  }
+}

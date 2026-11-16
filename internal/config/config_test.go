@@ -28,21 +28,21 @@ func TestParseRejectsUnknownFieldsAndBadValues(t *testing.T) {
 		t.Error("unknown field (typo) must be rejected")
 	}
 	bad := map[string]string{
-		"mode":         `{"mode":"prod"}`,
-		"listen":       `{"listen":"nonsense"}`,
-		"public_url":   `{"public_url":"ftp://x"}`,
-		"proxies":      `{"trusted_proxies":["not-an-ip"]}`,
-		"cors":         `{"cors":{"allowed_origins":["https://a.example/path"]}}`,
-		"token ttl":    `{"auth":{"access_token_ttl":"1s"}}`,
-		"pw length":    `{"auth":{"min_password_length":3}}`,
-		"argon":        `{"auth":{"argon2":{"memory_kib":16,"iterations":1,"parallelism":1}}}`,
-		"smtp tls":     `{"smtp":{"tls":"ssl3"}}`,
-		"smtp from":    `{"smtp":{"host":"mail","from":"not an address"}}`,
-		"rate":         `{"rate_limits":{"login":{"requests":0,"window":"1m"}}}`,
-		"metrics":      `{"monitoring":{"host_metrics_interval":"10ms"}}`,
-		"duration":     `{"auth":{"access_token_ttl":"soon"}}`,
-		"docker sock":  `{"tools":{"docker_socket":"relative.sock"}}`,
-		"log level":    `{"logging":{"level":"chatty"}}`,
+		"mode":        `{"mode":"prod"}`,
+		"listen":      `{"listen":"nonsense"}`,
+		"public_url":  `{"public_url":"ftp://x"}`,
+		"proxies":     `{"trusted_proxies":["not-an-ip"]}`,
+		"cors":        `{"cors":{"allowed_origins":["https://a.example/path"]}}`,
+		"token ttl":   `{"auth":{"access_token_ttl":"1s"}}`,
+		"pw length":   `{"auth":{"min_password_length":3}}`,
+		"argon":       `{"auth":{"argon2":{"memory_kib":16,"iterations":1,"parallelism":1}}}`,
+		"smtp tls":    `{"smtp":{"tls":"ssl3"}}`,
+		"smtp from":   `{"smtp":{"host":"mail","from":"not an address"}}`,
+		"rate":        `{"rate_limits":{"login":{"requests":0,"window":"1m"}}}`,
+		"metrics":     `{"monitoring":{"host_metrics_interval":"10ms"}}`,
+		"duration":    `{"auth":{"access_token_ttl":"soon"}}`,
+		"docker sock": `{"tools":{"docker_socket":"relative.sock"}}`,
+		"log level":   `{"logging":{"level":"chatty"}}`,
 	}
 	for name, doc := range bad {
 		if _, err := Parse([]byte(doc), "/x"); err == nil {

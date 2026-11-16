@@ -1,0 +1,16 @@
+# Caddy reverse proxy for Server Manager (automatic HTTPS).
+#
+# In config.json set:
+#   "listen": "127.0.0.1:8080"
+#   "public_url": "https://servers.example.com"
+#   "trusted_proxies": ["127.0.0.1/32", "::1/128"]
+
+servers.example.com {
+	encode zstd gzip
+
+	reverse_proxy 127.0.0.1:8080 {
+		# Deliver Server-Sent Events (live console, status updates)
+		# immediately instead of buffering them.
+		flush_interval -1
+	}
+}

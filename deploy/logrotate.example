@@ -1,0 +1,13 @@
+# /etc/logrotate.d/server-manager
+# Only needed when "logging.file" is set; by default logs go to journald.
+/var/log/server-manager/*.log {
+    weekly
+    rotate 8
+    compress
+    delaycompress
+    missingok
+    notifempty
+    postrotate
+        systemctl reload server-manager.service >/dev/null 2>&1 || true
+    endscript
+}

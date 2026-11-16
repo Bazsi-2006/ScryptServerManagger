@@ -1,0 +1,27 @@
+# /etc/sudoers.d/server-manager   (install with: visudo -f /etc/sudoers.d/server-manager)
+#
+# Lets the service user control ONLY the listed systemd units, and only with
+# the exact arguments Server Manager uses. Used by servers configured with
+# "systemd": { "use_sudo": true }.
+#
+# Never grant ALL or a bare "systemctl": that would be root access.
+# List every unit explicitly; do not use wildcards in unit names.
+
+Cmnd_Alias SM_MINECRAFT = \
+    /usr/bin/systemctl start --no-block minecraft.service, \
+    /usr/bin/systemctl stop --no-block minecraft.service, \
+    /usr/bin/systemctl restart minecraft.service
+
+Cmnd_Alias SM_VALHEIM = \
+    /usr/bin/systemctl start --no-block valheim.service, \
+    /usr/bin/systemctl stop --no-block valheim.service, \
+    /usr/bin/systemctl restart valheim.service
+
+server-manager ALL=(root) NOPASSWD: SM_MINECRAFT, SM_VALHEIM
+
+# Running a game server's scripts as its own user (custom backend):
+# configure the start command as  /usr/bin/sudo  with arguments
+#   -n, -u, minecraft, /opt/minecraft/start.sh
+# and allow exactly that:
+#
+# server-manager ALL=(minecraft) NOPASSWD: /opt/minecraft/start.sh, /opt/minecraft/stop.sh

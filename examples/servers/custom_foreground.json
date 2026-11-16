@@ -1,0 +1,25 @@
+{
+  "id": "custom_foreground",
+  "name": "Custom app (foreground)",
+  "description": "The start command IS the server. Output is captured, commands go to its standard input, and it keeps running across manager restarts.",
+  "category": "Examples",
+  "backend": "custom",
+  "working_dir": "/opt/gameservers/example",
+  "custom": {
+    "mode": "foreground",
+    "start": {
+      "command": "/opt/gameservers/example/start.sh",
+      "args": ["--port", "27015"]
+    },
+    "stop_input": "quit",
+    "kill_on_timeout": true,
+    "on_manager_exit": "keep"
+  },
+  "console": { "input": "stdin" },
+  "readiness": {
+    "method": "port",
+    "port": { "host": "127.0.0.1", "port": 27015, "protocol": "tcp", "timeout": "2s" },
+    "interval": "2s"
+  },
+  "timeouts": { "start": "2m", "stop": "30s" }
+}

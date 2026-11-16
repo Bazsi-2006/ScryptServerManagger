@@ -1,0 +1,29 @@
+{
+  "id": "minecraft_survival",
+  "name": "Minecraft Survival",
+  "description": "Paper server running in a tmux session. Console is streamed live; commands are typed into the pane.",
+  "category": "Minecraft",
+  "backend": "tmux",
+  "working_dir": "/opt/minecraft/survival",
+  "env": {
+    "JAVA_TOOL_OPTIONS": "-Xms2G -Xmx4G"
+  },
+  "tmux": {
+    "session": "mc-survival",
+    "start": {
+      "command": "/usr/bin/java",
+      "args": ["-jar", "paper.jar", "--nogui"]
+    },
+    "stop_text": "stop",
+    "kill_on_timeout": true
+  },
+  "readiness": {
+    "method": "console",
+    "console": { "pattern": "Done \\([0-9.]+s\\)! For help, type \"help\"", "regex": true }
+  },
+  "backup": {
+    "directory": "/opt/minecraft/survival/backups",
+    "command": { "command": "/opt/minecraft/survival/backup.sh" }
+  },
+  "timeouts": { "start": "3m", "stop": "1m", "backup": "30m" }
+}

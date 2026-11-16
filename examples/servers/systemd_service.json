@@ -1,0 +1,21 @@
+{
+  "id": "systemd_service",
+  "name": "Valheim (systemd)",
+  "description": "An existing systemd unit. State comes from systemd, output from the journal. Requires a sudoers or polkit rule for this unit.",
+  "category": "Examples",
+  "backend": "systemd",
+  "systemd": {
+    "unit": "valheim.service",
+    "scope": "system",
+    "use_sudo": true,
+    "allow_restart": true
+  },
+  "readiness": {
+    "method": "console",
+    "console": { "pattern": "Game server connected" }
+  },
+  "backup": {
+    "directory": "/var/backups/valheim"
+  },
+  "timeouts": { "start": "5m", "stop": "2m" }
+}

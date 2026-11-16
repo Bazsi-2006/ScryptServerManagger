@@ -64,7 +64,9 @@ func TestFirstRunBootstrap(t *testing.T) {
 	}
 	store.Close()
 
-	short := func() error { return cmdAdmin([]string{"create", "--config", cfgPath, "--username", "root", "--password-stdin"}) }
+	short := func() error {
+		return cmdAdmin([]string{"create", "--config", cfgPath, "--username", "root", "--password-stdin"})
+	}
 	if err := withStdin(t, "short\n", short); err == nil {
 		t.Fatal("a too-short password must be rejected")
 	}

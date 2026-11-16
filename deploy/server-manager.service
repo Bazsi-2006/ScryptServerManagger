@@ -1,0 +1,46 @@
+[Unit]
+Description=Server Manager - universal Linux server manager
+Documentation=https://github.com/Bazsi-2006/ScryptServerManagger
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=server-manager
+Group=server-manager
+ExecStart=/usr/local/bin/server-manager serve --config /etc/server-manager/config.json
+# Reload re-reads the server definition files and reopens the log file.
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+
+# Secrets (SM_JWT_SECRET, SM_SMTP_PASSWORD) are read from this root-owned
+# file by systemd; the leading "-" makes it optional.
+EnvironmentFile=-/etc/server-manager/server-manager.env
+
+# IMPORTANT: only the manager itself is signalled on stop/restart. Servers it
+# started (custom processes, tmux sessions) live in the same control group;
+# with the default KillMode they would all be killed whenever the manager is
+# restarted or upgraded. The manager re-adopts them when it starts again.
+KillMode=process
+# Servers configured with on_manager_exit=stop are shut down gracefully
+# during this window.
+TimeoutStopSec=300
+
+# File descriptors for many servers, streams and log followers.
+LimitNOFILE=65536
+
+# Hardening. These are deliberately moderate: the manager must be able to
+# run your server commands with their normal view of the system. Tighten
+# them if all your servers are systemd units or Docker containers.
+NoNewPrivileges=false
+PrivateTmp=false
+ProtectSystem=false
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=false
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

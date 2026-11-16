@@ -1,0 +1,31 @@
+{
+  "id": "custom_scripts",
+  "name": "Custom app (start/stop scripts)",
+  "description": "start.sh launches the server in the background and exits; stop.sh shuts it down; check-status.sh reports whether it is running (exit 0), not running (exit 1) or unknown (anything else).",
+  "category": "Examples",
+  "backend": "custom",
+  "working_dir": "/opt/gameservers/example",
+  "env": {
+    "SERVER_PORT": "27015"
+  },
+  "custom": {
+    "mode": "forking",
+    "start": { "command": "/opt/gameservers/example/start.sh", "args": ["--port", "27015"] },
+    "stop": { "command": "/opt/gameservers/example/stop.sh" },
+    "log_file": "/opt/gameservers/example/logs/latest.log"
+  },
+  "readiness": {
+    "method": "script",
+    "script": { "command": "/opt/gameservers/example/check-status.sh", "timeout": "5s" },
+    "interval": "3s"
+  },
+  "console": {
+    "input": "command",
+    "input_command": { "command": "/opt/gameservers/example/send-command.sh", "args": ["{command}"] }
+  },
+  "backup": {
+    "directory": "/opt/gameservers/example/backups",
+    "command": { "command": "/opt/gameservers/example/backup.sh" }
+  },
+  "timeouts": { "start": "2m", "stop": "1m", "backup": "1h", "command": "10s" }
+}
