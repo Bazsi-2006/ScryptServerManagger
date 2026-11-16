@@ -55,6 +55,7 @@ function consoleTab(server) {
     else jump.hidden = false;
   }
   function add(lines) {
+    if (lines.length) note.hidden = true;
     for (const l of lines) pending.push(typeof l === 'string' ? l : l.text);
     if (!raf) raf = requestAnimationFrame(flush);
   }
