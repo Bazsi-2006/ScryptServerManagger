@@ -1,0 +1,30 @@
+{
+  "id": "minecraft",
+  "name": "Minecraft",
+  "description": "Minecraft Java server in tmux, started by examples/minecraft/start.sh. Live console, commands, graceful stop and consistent backups.",
+  "category": "Minecraft",
+  "backend": "tmux",
+  "working_dir": "/opt/minecraft",
+  "env": {
+    "SERVER_JAR": "server.jar",
+    "MIN_MEMORY": "2G",
+    "MAX_MEMORY": "4G",
+    "TMUX_SESSION": "minecraft",
+    "KEEP_BACKUPS": "14"
+  },
+  "tmux": {
+    "session": "minecraft",
+    "start": { "command": "/opt/minecraft/start.sh" },
+    "stop_text": "stop",
+    "kill_on_timeout": true
+  },
+  "readiness": {
+    "method": "console",
+    "console": { "pattern": "Done \\([0-9.,]+s\\)! For help", "regex": true }
+  },
+  "backup": {
+    "directory": "/opt/minecraft/backups",
+    "command": { "command": "/opt/minecraft/backup.sh" }
+  },
+  "timeouts": { "start": "5m", "stop": "2m", "backup": "30m" }
+}
