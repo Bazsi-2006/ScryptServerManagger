@@ -80,6 +80,66 @@ key (`/var/lib/server-manager/secrets/jwt.key`, mode 0600).
 > just work. See [permissions.md](permissions.md) for the alternatives. Do not
 > run it as root.
 
+### Installing under /opt instead
+
+Every location comes from the configuration file, and relative paths in it
+are resolved against the directory that holds it, so the whole installation
+can live in one directory. A layout that keeps the program read-only for the
+service account:
+
+| Path | Owner, mode | Contents |
+|---|---|---|
+| `/opt/server-manager/bin/server-manager` | root, 0755 | the program |
+| `/opt/server-manager/etc/` | service user, 0750 | `config.json`, `servers/`, optional `server-manager.env` |
+| `/opt/server-manager/data/` | service user, 0700 | database, signing key, runtime files |
+
+The service user must be able to write `etc/` (settings saved from the web
+UI are written there), but should not be able to replace its own program,
+which is why the program sits in a separate root-owned `bin/`.
+
+```bash
+sudo useradd --system --home-dir /opt/server-manager --shell /usr/sbin/nologin server-manager
+```
+
+```bash
+sudo install -d -m 0755 /opt/server-manager /opt/server-manager/bin
+```
+
+```bash
+sudo install -m 0755 server-manager /opt/server-manager/bin/server-manager
+```
+
+```bash
+sudo install -d -m 0750 -o server-manager -g server-manager /opt/server-manager/etc
+```
+
+```bash
+sudo install -d -m 0700 -o server-manager -g server-manager /opt/server-manager/data
+```
+
+```bash
+sudo -u server-manager /opt/server-manager/bin/server-manager init --config /opt/server-manager/etc/config.json --data-dir ../data
+```
+
+`--data-dir ../data` is stored relative to `config.json`, so the directory
+can be moved or copied as a whole later. Use
+[deploy/server-manager-opt.service](../deploy/server-manager-opt.service) as
+the unit:
+
+```bash
+sudo install -m 0644 deploy/server-manager-opt.service /etc/systemd/system/server-manager.service
+```
+
+```bash
+sudo systemctl daemon-reload
+```
+
+The command-line tools look for `/etc/server-manager/config.json` unless told
+otherwise, so pass `--config /opt/server-manager/etc/config.json` to every
+command (or export `SM_CONFIG=/opt/server-manager/etc/config.json`). Nothing
+is written outside `/opt/server-manager` except the systemd unit file; logs go
+to the journal.
+
 ## 3. Configure
 
 Edit `/etc/server-manager/config.json`. At minimum set the address users will
