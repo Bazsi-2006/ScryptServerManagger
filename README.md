@@ -134,3 +134,6 @@ The suite covers every module and includes integration tests that start real
 processes. tmux tests need the `tmux` binary (skipped otherwise); Docker and
 systemd are exercised against stand-ins, so neither is required. Details in
 [docs/development.md](docs/development.md).
+
+# WARNING!:
+The whole project is vibe coded! Use it at your own risk!
