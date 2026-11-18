@@ -1,0 +1,20 @@
+{
+  "id": "docker_container",
+  "name": "Minecraft (Docker)",
+  "description": "An existing container. State and logs come from the Docker Engine API; console commands run a fixed helper inside the container.",
+  "category": "Minecraft",
+  "backend": "docker",
+  "docker": {
+    "container": "minecraft",
+    "allow_restart": true
+  },
+  "console": {
+    "input": "docker_exec",
+    "input_command": { "command": "rcon-cli", "args": ["{command}"] }
+  },
+  "readiness": {
+    "method": "port",
+    "port": { "host": "127.0.0.1", "port": 25565, "protocol": "tcp" }
+  },
+  "timeouts": { "start": "5m", "stop": "1m" }
+}

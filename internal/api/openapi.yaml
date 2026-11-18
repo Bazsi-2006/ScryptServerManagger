@@ -1,0 +1,754 @@
+openapi: 3.0.3
+info:
+  title: Server Manager API
+  version: "1"
+  description: |
+    HTTP API of Server Manager, a self-hosted manager for game servers and
+    other services.
+
+    **Authentication.** `POST /auth/login` returns a short-lived access token
+    (send it as `Authorization: Bearer <token>`) and sets a rotating refresh
+    token in an `HttpOnly`, `SameSite=Strict` cookie scoped to
+    `/api/v1/auth`. `POST /auth/refresh` exchanges the cookie for a new
+    access token and rotates the cookie. The two cookie-authenticated
+    endpoints (`/auth/refresh`, `/auth/logout`) require the header
+    `X-Requested-With: server-manager`.
+
+    **Authorization.** Administrators may do everything. Other users hold a
+    bitmask per server: START=1, STOP=2 (implies START), CONSOLE_READ=4,
+    CONSOLE_WRITE=8 (implies CONSOLE_READ), BACKUPS=16, CONFIG=32. A server
+    the caller has no permission for answers `404`, exactly like a server
+    that does not exist; a visible server without the specific permission
+    answers `403`.
+
+    **Errors.** Every error has the shape `{"error": {"code", "message",
+    "details"?}}`. Codes distinguish the cause:
+
+    | HTTP | code | meaning |
+    |---|---|---|
+    | 400 | `invalid_request` | malformed body or parameter |
+    | 401 | `unauthenticated`, `token_expired`, `invalid_credentials` | not signed in |
+    | 403 | `permission_denied`, `csrf_rejected`, `account_disabled` | missing permission |
+    | 404 | `not_found` | unknown or invisible resource |
+    | 409 | `already_running`, `not_running`, `operation_in_progress`, `server_active`, `unsupported_action`, `already_exists` | conflict with current state |
+    | 413 | `request_too_large`, `download_too_large` | size limit |
+    | 422 | `validation_failed` | invalid configuration (details list fields) |
+    | 429 | `rate_limited`, `cooldown` | slow down (`Retry-After`) |
+    | 502 | `operation_failed`, `email_failed` | the server operation failed |
+    | 503 | `backend_unavailable` | tmux/systemd/Docker cannot be reached |
+    | 504 | `command_timeout` | a command timed out |
+
+    A server whose state cannot be determined is not an error response: its
+    status carries the state `UNKNOWN` and a message.
+
+    **Asynchronous operations.** Start, stop, restart and backup return
+    `202 Accepted` at once. Follow progress through `GET
+    /servers/{id}/status` or the event stream.
+
+    **Streams.** `GET /events` and `GET /servers/{id}/console/stream` are
+    Server-Sent Events authenticated with the `Authorization` header (read
+    them with `fetch`, not `EventSource`). Tokens are never accepted in
+    URLs. Both honour `Last-Event-ID`.
+servers:
+  - url: /api/v1
+security:
+  - bearer: []
+tags:
+  - name: auth
+  - name: profile
+  - name: servers
+  - name: console
+  - name: backups
+  - name: realtime
+  - name: admin
+paths:
+  /health:
+    get:
+      tags: [auth]
+      summary: Liveness probe
+      security: []
+      responses:
+        "200": { description: OK }
+  /auth/login:
+    post:
+      tags: [auth]
+      summary: Sign in
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string }
+                password: { type: string, format: password }
+      responses:
+        "200":
+          description: Signed in; sets the refresh cookie.
+          content: { application/json: { schema: { $ref: "#/components/schemas/Session" } } }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { description: Account disabled, content: { application/json: { schema: { $ref: "#/components/schemas/ErrorBody" } } } }
+        "429": { $ref: "#/components/responses/Error" }
+  /auth/refresh:
+    post:
+      tags: [auth]
+      summary: Rotate the refresh token and get a new access token
+      security: [{ refreshCookie: [] }]
+      parameters: [{ $ref: "#/components/parameters/XRequestedWith" }]
+      responses:
+        "200": { description: New access token, content: { application/json: { schema: { $ref: "#/components/schemas/Session" } } } }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+  /auth/logout:
+    post:
+      tags: [auth]
+      summary: Revoke the current session
+      security: [{ refreshCookie: [] }]
+      parameters: [{ $ref: "#/components/parameters/XRequestedWith" }]
+      responses:
+        "204": { description: Logged out }
+  /auth/invitation:
+    post:
+      tags: [auth]
+      summary: Check an invitation token
+      security: []
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [token], properties: { token: { type: string } } } } }
+      responses:
+        "200": { description: The invitation is valid }
+        "404": { $ref: "#/components/responses/Error" }
+  /auth/register:
+    post:
+      tags: [auth]
+      summary: Create an account with an invitation
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token, username, password]
+              properties:
+                token: { type: string }
+                username: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9_.-]{2,31}$" }
+                display_name: { type: string, maxLength: 80 }
+                password: { type: string, format: password }
+      responses:
+        "201": { description: Account created and signed in, content: { application/json: { schema: { $ref: "#/components/schemas/Session" } } } }
+        "400": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+  /auth/email/verify:
+    post:
+      tags: [auth]
+      summary: Confirm an email address change
+      security: []
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [token], properties: { token: { type: string } } } } }
+      responses:
+        "200": { description: Address updated }
+        "404": { $ref: "#/components/responses/Error" }
+  /me:
+    get:
+      tags: [profile]
+      summary: Current user, effective permissions and feature flags
+      responses:
+        "200": { description: OK }
+    patch:
+      tags: [profile]
+      summary: Change the display name
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, properties: { display_name: { type: string } } } } }
+      responses:
+        "200": { description: Updated }
+  /me/password:
+    post:
+      tags: [profile]
+      summary: Change the password (revokes all other sessions)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [current_password, new_password], properties: { current_password: { type: string }, new_password: { type: string } } }
+      responses:
+        "200": { description: Changed }
+        "403": { $ref: "#/components/responses/Error" }
+  /me/email:
+    post:
+      tags: [profile]
+      summary: Request an email change; a verification link is sent to the new address
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [email, current_password], properties: { email: { type: string, format: email }, current_password: { type: string } } }
+      responses:
+        "202": { description: Verification sent }
+        "409": { $ref: "#/components/responses/Error" }
+  /me/sessions:
+    get:
+      tags: [profile]
+      summary: List own active sessions
+      responses:
+        "200": { description: OK }
+  /me/sessions/{sid}:
+    delete:
+      tags: [profile]
+      summary: Revoke one of the caller's sessions
+      parameters: [{ name: sid, in: path, required: true, schema: { type: string } }]
+      responses:
+        "204": { description: Revoked }
+  /me/sessions/revoke-others:
+    post:
+      tags: [profile]
+      summary: Revoke every session except the current one
+      responses:
+        "200": { description: OK }
+  /events:
+    get:
+      tags: [realtime]
+      summary: Application-wide event stream (SSE)
+      description: |
+        Events: `hello` (`resync` tells the client to reload its state),
+        `server.status.changed`, `server.operation.started|completed|failed`,
+        `server.created|updated|deleted`, `server.backups.changed`,
+        `permissions.changed`, `profile.changed`, `host.metrics`, and for
+        administrators `users.changed`, `invitations.changed`,
+        `settings.changed`. `bye` precedes a server-side close. Each
+        subscriber only receives events it is authorized for; authorization
+        is re-evaluated when permissions, accounts or sessions change.
+      parameters: [{ $ref: "#/components/parameters/LastEventID" }]
+      responses:
+        "200": { description: Event stream, content: { text/event-stream: {} } }
+  /system/metrics:
+    get:
+      tags: [realtime]
+      summary: Host CPU and memory (latest sample and recent history)
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: object, properties: { latest: { $ref: "#/components/schemas/Metrics" }, history: { type: array, items: { $ref: "#/components/schemas/Metrics" } }, interval_ms: { type: integer } } } } } }
+        "403": { $ref: "#/components/responses/Error" }
+  /servers:
+    get:
+      tags: [servers]
+      summary: List the servers visible to the caller
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: object, properties: { servers: { type: array, items: { $ref: "#/components/schemas/Server" } } } } } } }
+    post:
+      tags: [servers]
+      summary: Create a server definition (administrators)
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/Definition" } } }
+      responses:
+        "201": { description: Created }
+        "409": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
+  /servers/{id}:
+    parameters: [{ $ref: "#/components/parameters/ServerID" }]
+    get:
+      tags: [servers]
+      summary: One server with status, capabilities and the caller's permissions
+      responses:
+        "200": { description: OK }
+        "404": { $ref: "#/components/responses/Error" }
+    delete:
+      tags: [servers]
+      summary: Delete a definition (administrators). The server's files are never touched.
+      parameters: [{ name: force, in: query, schema: { type: boolean }, description: Detach a running server instead of refusing. }]
+      responses:
+        "204": { description: Deleted }
+        "409": { $ref: "#/components/responses/Error" }
+  /servers/{id}/config:
+    parameters: [{ $ref: "#/components/parameters/ServerID" }]
+    get:
+      tags: [servers]
+      summary: Full definition (CONFIG). Environment values are masked for non-administrators.
+      responses:
+        "200": { description: OK }
+    put:
+      tags: [servers]
+      summary: Replace the definition (CONFIG)
+      description: |
+        Non-administrators may only change the name, description, category,
+        timeouts, cooldown, polling intervals and the console readiness
+        pattern. Changes to anything that affects execution are refused with
+        403. Execution changes are refused with 409 while the server is
+        running.
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/Definition" } } }
+      responses:
+        "200": { description: Saved }
+        "403": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
+  /servers/{id}/status:
+    parameters: [{ $ref: "#/components/parameters/ServerID" }]
+    get:
+      tags: [servers]
+      summary: Current lifecycle state
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: object, properties: { status: { $ref: "#/components/schemas/Status" } } } } } }
+  /servers/{id}/operations:
+    parameters: [{ $ref: "#/components/parameters/ServerID" }]
+    get:
+      tags: [servers]
+      summary: Recent operation history
+      responses:
+        "200": { description: OK }
+  /servers/{id}/start:
+    parameters: [{ $ref: "#/components/parameters/ServerID" }]
+    post:
+      tags: [servers]
+      summary: Start (START)
+      responses:
+        "202": { $ref: "#/components/responses/Accepted" }
+        "409": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
+  /servers/{id}/stop:
+    parameters: [{ $ref: "#/components/parameters/ServerID" }]
+    post:
+      tags: [servers]
+      summary: Stop (STOP). Cancels a start that is still in progress.
+      responses:
+        "202": { $ref: "#/components/responses/Accepted" }
+        "409": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
+  /servers/{id}/restart:
+    parameters: [{ $ref: "#/components/parameters/ServerID" }]
+    post:
+      tags: [servers]
+      summary: Restart (STOP), where the backend and configuration allow it
+      responses:
+        "202": { $ref: "#/components/responses/Accepted" }
+        "409": { $ref: "#/components/responses/Error" }
+  /servers/{id}/console:
+    parameters: [{ $ref: "#/components/parameters/ServerID" }]
+    get:
+      tags: [console]
+      summary: Console snapshot (CONSOLE_READ)
+      parameters: [{ name: lines, in: query, schema: { type: integer, minimum: 1 } }]
+      responses:
+        "200":
+          description: Recent lines. `note` explains why none are available, when that is the case.
+          content: { application/json: { schema: { type: object, properties: { lines: { type: array, items: { type: string } }, source: { type: string, enum: [buffer, backend] }, note: { type: string } } } } }
+  /servers/{id}/console/stream:
+    parameters: [{ $ref: "#/components/parameters/ServerID" }]
+    get:
+      tags: [console]
+      summary: Live console (SSE, CONSOLE_READ)
+      description: |
+        Events: `reset` (discard what was shown), `lines` (`{lines: [{seq,
+        text}]}`), `ready` (backlog delivered), `bye`. Event IDs are
+        `<epoch>:<seq>`; reconnecting with `Last-Event-ID` resumes after the
+        last line seen, or resets when that is no longer possible.
+      parameters: [{ $ref: "#/components/parameters/LastEventID" }]
+      responses:
+        "200": { description: Event stream, content: { text/event-stream: {} } }
+  /servers/{id}/console/history:
+    parameters: [{ $ref: "#/components/parameters/ServerID" }]
+    get:
+      tags: [console]
+      summary: The caller's own recent commands (CONSOLE_WRITE)
+      responses:
+        "200": { description: OK }
+  /servers/{id}/console/command:
+    parameters: [{ $ref: "#/components/parameters/ServerID" }]
+    post:
+      tags: [console]
+      summary: Send one line to the server console (CONSOLE_WRITE)
+      description: The text is delivered to the server's own console input. It is never executed by a shell on the host.
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [command], properties: { command: { type: string } } } } }
+      responses:
+        "204": { description: Delivered }
+        "400": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "502": { $ref: "#/components/responses/Error" }
+  /servers/{id}/backups:
+    parameters: [{ $ref: "#/components/parameters/ServerID" }]
+    get:
+      tags: [backups]
+      summary: List backup files (BACKUPS)
+      responses:
+        "200": { description: OK }
+    post:
+      tags: [backups]
+      summary: Run the configured backup command (BACKUPS)
+      responses:
+        "202": { $ref: "#/components/responses/Accepted" }
+        "409": { $ref: "#/components/responses/Error" }
+  /servers/{id}/backups/cancel:
+    parameters: [{ $ref: "#/components/parameters/ServerID" }]
+    post:
+      tags: [backups]
+      summary: Cancel a running backup (BACKUPS)
+      responses:
+        "204": { description: Cancelled }
+  /servers/{id}/backups/{name}:
+    parameters:
+      - { $ref: "#/components/parameters/ServerID" }
+      - { name: name, in: path, required: true, schema: { type: string } }
+    delete:
+      tags: [backups]
+      summary: Delete a backup file (administrators, or BACKUPS holders if enabled for the server)
+      responses:
+        "204": { description: Deleted }
+  /servers/{id}/backups/{name}/download:
+    parameters:
+      - { $ref: "#/components/parameters/ServerID" }
+      - { name: name, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [backups]
+      summary: Create a single-use download link (BACKUPS)
+      description: Returns a URL valid for 60 seconds and one request. It is bound to this file and carries no other authority.
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: object, properties: { url: { type: string }, expires_in: { type: integer }, size: { type: integer }, name: { type: string } } } } } }
+  /downloads/{ticket}:
+    get:
+      tags: [backups]
+      summary: Download a backup with a ticket
+      security: []
+      parameters: [{ name: ticket, in: path, required: true, schema: { type: string } }]
+      responses:
+        "200": { description: File contents, content: { application/octet-stream: {} } }
+        "404": { $ref: "#/components/responses/Error" }
+  /servers/{id}/permissions:
+    parameters: [{ $ref: "#/components/parameters/ServerID" }]
+    get:
+      tags: [admin]
+      summary: Every user's mask for this server (administrators)
+      responses:
+        "200": { description: OK }
+  /admin/users:
+    get:
+      tags: [admin]
+      summary: List users
+      responses:
+        "200": { description: OK }
+  /admin/users/{uid}:
+    parameters: [{ $ref: "#/components/parameters/UserID" }]
+    get:
+      tags: [admin]
+      summary: User with permissions and sessions
+      responses:
+        "200": { description: OK }
+    patch:
+      tags: [admin]
+      summary: Update a user (display name, email, administrator role, disabled)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, properties: { display_name: { type: string }, email: { type: string }, is_admin: { type: boolean }, disabled: { type: boolean } } }
+      responses:
+        "200": { description: Updated }
+        "409": { $ref: "#/components/responses/Error" }
+    delete:
+      tags: [admin]
+      summary: Delete a user
+      responses:
+        "204": { description: Deleted }
+        "409": { $ref: "#/components/responses/Error" }
+  /admin/users/{uid}/permissions/{id}:
+    parameters:
+      - { $ref: "#/components/parameters/UserID" }
+      - { $ref: "#/components/parameters/ServerID" }
+    put:
+      tags: [admin]
+      summary: Set a user's permission bitmask for a server (0 removes access)
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [mask], properties: { mask: { type: integer, minimum: 0, maximum: 63 } } } } }
+      responses:
+        "200": { description: Saved }
+  /admin/users/{uid}/sessions:
+    parameters: [{ $ref: "#/components/parameters/UserID" }]
+    delete:
+      tags: [admin]
+      summary: Revoke all sessions of a user
+      responses:
+        "200": { description: OK }
+  /admin/users/{uid}/sessions/{sid}:
+    parameters:
+      - { $ref: "#/components/parameters/UserID" }
+      - { name: sid, in: path, required: true, schema: { type: string } }
+    delete:
+      tags: [admin]
+      summary: Revoke one session of a user
+      responses:
+        "200": { description: OK }
+  /admin/invitations:
+    get:
+      tags: [admin]
+      summary: List invitations
+      responses:
+        "200": { description: OK }
+    post:
+      tags: [admin]
+      summary: Create an invitation
+      description: |
+        With `email` the link is sent by email. The response contains the
+        link only when it did not reach the recipient by email (no address,
+        delivery failed, or development mode). A delivery failure never
+        invalidates the invitation.
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { email: { type: string, format: email }, expires_in_hours: { type: integer, minimum: 1, maximum: 2160 } } }
+      responses:
+        "201": { description: Created }
+  /admin/invitations/{iid}:
+    parameters: [{ name: iid, in: path, required: true, schema: { type: integer } }]
+    delete:
+      tags: [admin]
+      summary: Revoke a pending invitation
+      responses:
+        "204": { description: Revoked }
+  /admin/invitations/{iid}/resend:
+    parameters: [{ name: iid, in: path, required: true, schema: { type: integer } }]
+    post:
+      tags: [admin]
+      summary: Issue a fresh link (the old one stops working) and send it again
+      responses:
+        "200": { description: OK }
+  /admin/audit:
+    get:
+      tags: [admin]
+      summary: Query the audit log (newest first)
+      parameters:
+        - { name: user_id, in: query, schema: { type: integer } }
+        - { name: username, in: query, schema: { type: string } }
+        - { name: server_id, in: query, schema: { type: string } }
+        - { name: action, in: query, schema: { type: string } }
+        - { name: result, in: query, schema: { type: string, enum: [SUCCESS, FAILURE, DENIED, REQUESTED] } }
+        - { name: from, in: query, schema: { type: string, format: date-time } }
+        - { name: to, in: query, schema: { type: string, format: date-time } }
+        - { name: before_id, in: query, schema: { type: integer } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 500, default: 100 } }
+      responses:
+        "200": { description: OK }
+  /admin/settings:
+    get:
+      tags: [admin]
+      summary: Editable settings plus read-only installation info. Never contains secrets.
+      responses:
+        "200": { description: OK }
+    put:
+      tags: [admin]
+      summary: Update settings (persisted to the configuration file, applied immediately)
+      responses:
+        "200": { description: Saved }
+        "422": { $ref: "#/components/responses/Error" }
+  /admin/settings/test-email:
+    post:
+      tags: [admin]
+      summary: Send a test email
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [to], properties: { to: { type: string, format: email } } } } }
+      responses:
+        "200": { description: Sent (or logged in development mode) }
+        "502": { $ref: "#/components/responses/Error" }
+  /admin/servers/reload:
+    post:
+      tags: [admin]
+      summary: Re-read the server definition files from disk
+      responses:
+        "200": { description: OK }
+components:
+  securitySchemes:
+    bearer: { type: http, scheme: bearer, bearerFormat: JWT }
+    refreshCookie: { type: apiKey, in: cookie, name: sm_refresh }
+  parameters:
+    ServerID: { name: id, in: path, required: true, schema: { type: string, pattern: "^[a-z0-9][a-z0-9_-]{0,62}$" } }
+    UserID: { name: uid, in: path, required: true, schema: { type: integer } }
+    XRequestedWith: { name: X-Requested-With, in: header, required: true, schema: { type: string, enum: [server-manager] } }
+    LastEventID: { name: Last-Event-ID, in: header, required: false, schema: { type: string } }
+  responses:
+    Error:
+      description: Error
+      content: { application/json: { schema: { $ref: "#/components/schemas/ErrorBody" } } }
+    Accepted:
+      description: The operation was accepted and runs in the background.
+      content:
+        application/json:
+          schema: { type: object, properties: { operation: { $ref: "#/components/schemas/Operation" }, status: { $ref: "#/components/schemas/Status" } } }
+  schemas:
+    ErrorBody:
+      type: object
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string }
+            message: { type: string }
+            details: {}
+    User:
+      type: object
+      properties:
+        id: { type: integer }
+        username: { type: string }
+        display_name: { type: string }
+        email: { type: string }
+        is_admin: { type: boolean }
+        disabled: { type: boolean }
+        created_at: { type: string, format: date-time }
+        last_login_at: { type: string, format: date-time, nullable: true }
+    Session:
+      type: object
+      properties:
+        access_token: { type: string }
+        token_type: { type: string, enum: [Bearer] }
+        expires_in: { type: integer, description: Seconds }
+        session_id: { type: string }
+        user: { $ref: "#/components/schemas/User" }
+        permissions: { type: object, additionalProperties: { type: integer }, description: Effective mask per server ID }
+        features: { type: object }
+    Status:
+      type: object
+      properties:
+        server_id: { type: string }
+        state: { type: string, enum: [STOPPED, STARTING, RUNNING, STOPPING, ERROR, UNKNOWN] }
+        message: { type: string }
+        since: { type: string, format: date-time }
+        operation: { allOf: [{ $ref: "#/components/schemas/Operation" }], nullable: true }
+    Operation:
+      type: object
+      properties:
+        id: { type: integer }
+        type: { type: string, enum: [start, stop, restart, backup] }
+        user: { type: string }
+        started_at: { type: string, format: date-time }
+    Server:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        description: { type: string }
+        category: { type: string }
+        backend: { type: string, enum: [custom, tmux, systemd, docker] }
+        status: { $ref: "#/components/schemas/Status" }
+        capabilities:
+          type: object
+          properties:
+            start: { type: boolean }
+            stop: { type: boolean }
+            restart: { type: boolean }
+            console_input: { type: boolean }
+            backups: { type: boolean }
+            backup_create: { type: boolean }
+        permissions: { type: integer, description: The caller's effective mask }
+    Metrics:
+      type: object
+      properties:
+        time: { type: string, format: date-time }
+        cpu_percent: { type: number }
+        cpu_count: { type: integer }
+        mem_total_bytes: { type: integer }
+        mem_available_bytes: { type: integer }
+        mem_used_bytes: { type: integer }
+        mem_used_percent: { type: number }
+        load1: { type: number }
+        load5: { type: number }
+        load15: { type: number }
+        uptime_seconds: { type: integer }
+    Command:
+      type: object
+      required: [command]
+      properties:
+        command: { type: string, description: Absolute path or a program name found in PATH. Executed directly, never through a shell. }
+        args: { type: array, items: { type: string } }
+    Definition:
+      type: object
+      description: A server definition, stored as `<servers_dir>/<id>.json`. See docs/configuration.md for every field.
+      required: [id, name, backend]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        description: { type: string }
+        category: { type: string }
+        backend: { type: string, enum: [custom, tmux, systemd, docker] }
+        working_dir: { type: string }
+        env: { type: object, additionalProperties: { type: string } }
+        custom:
+          type: object
+          properties:
+            mode: { type: string, enum: [foreground, forking] }
+            start: { $ref: "#/components/schemas/Command" }
+            stop: { $ref: "#/components/schemas/Command" }
+            stop_input: { type: string }
+            stop_signal: { type: string }
+            kill_on_timeout: { type: boolean }
+            pid_file: { type: string }
+            log_file: { type: string }
+            on_manager_exit: { type: string, enum: [keep, stop] }
+        tmux:
+          type: object
+          properties:
+            session: { type: string }
+            window: { type: string }
+            pane: { type: string }
+            socket_name: { type: string }
+            socket_path: { type: string }
+            start: { $ref: "#/components/schemas/Command" }
+            stop_text: { type: string }
+            stop_keys: { type: array, items: { type: string } }
+            kill_on_timeout: { type: boolean }
+            width: { type: integer }
+            height: { type: integer }
+        systemd:
+          type: object
+          properties:
+            unit: { type: string }
+            scope: { type: string, enum: [system, user] }
+            use_sudo: { type: boolean }
+            allow_restart: { type: boolean }
+        docker:
+          type: object
+          properties:
+            container: { type: string }
+            allow_restart: { type: boolean }
+        readiness:
+          type: object
+          properties:
+            method: { type: string, enum: [none, console, port, script] }
+            interval: { type: string, example: 2s }
+            console: { type: object, properties: { pattern: { type: string }, regex: { type: boolean } } }
+            port:
+              type: object
+              properties:
+                host: { type: string }
+                port: { type: integer }
+                protocol: { type: string, enum: [tcp, udp] }
+                timeout: { type: string }
+                udp_payload_hex: { type: string }
+            script: { type: object, properties: { command: { type: string }, args: { type: array, items: { type: string } }, timeout: { type: string } } }
+        console:
+          type: object
+          properties:
+            input: { type: string, enum: ["", none, stdin, pty, tmux, command, docker_exec] }
+            input_command: { $ref: "#/components/schemas/Command" }
+        backup:
+          type: object
+          properties:
+            directory: { type: string }
+            command: { $ref: "#/components/schemas/Command" }
+            allow_user_delete: { type: boolean }
+        timeouts:
+          type: object
+          properties:
+            start: { type: string, example: 2m }
+            stop: { type: string, example: 1m }
+            backup: { type: string, example: 1h }
+            command: { type: string, example: 15s }
+        cooldown: { type: string }
+        status_poll_interval: { type: string }

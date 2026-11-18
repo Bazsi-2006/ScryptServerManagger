@@ -1,0 +1,7 @@
+/dist/
+/server-manager
+*.db
+*.db-wal
+*.db-shm
+/.dev/
+node_modules/
