@@ -19,7 +19,7 @@
   },
   "readiness": {
     "method": "console",
-    "console": { "pattern": "Done \\([0-9.]+s\\)! For help, type \"help\"", "regex": true }
+    "console": { "pattern": "Done \\([0-9.,]+s\\)! For help, type \"help\"", "regex": true }
   },
   "backup": {
     "directory": "/opt/minecraft/survival/backups",

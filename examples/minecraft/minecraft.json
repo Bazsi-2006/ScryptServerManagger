@@ -15,7 +15,7 @@
   },
   "readiness": {
     "method": "console",
-    "console": { "pattern": "Done \\([0-9.]+s\\)! For help, type \"help\"", "regex": true },
+    "console": { "pattern": "Done \\([0-9.,]+s\\)! For help, type \"help\"", "regex": true },
     "interval": "2s"
   },
   "timeouts": { "start": "5m", "stop": "2m", "command": "15s" }
