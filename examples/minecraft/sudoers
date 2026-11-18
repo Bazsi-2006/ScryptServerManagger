@@ -1,0 +1,7 @@
+# /etc/sudoers.d/server-manager-minecraft
+# Install with:  sudo visudo -f /etc/sudoers.d/server-manager-minecraft
+#
+# Lets the Server Manager service user (here: server-manager) run exactly
+# this one script as gameserver, with no arguments (the trailing "" forbids
+# arguments). Nothing else is allowed.
+server-manager ALL=(gameserver) NOPASSWD: /home/gameserver/minecraft/start.sh ""

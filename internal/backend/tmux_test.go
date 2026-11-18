@@ -160,3 +160,83 @@ func TestTmuxAttachOnlyAndMissingBinary(t *testing.T) {
 		t.Fatalf("missing tmux binary: %+v", p)
 	}
 }
+
+func TestTmuxInstantFailureKeepsItsOutputAndExitCode(t *testing.T) {
+	e, socket := tmuxEnv(t)
+	dir := t.TempDir()
+	// Fails within milliseconds, like a start script refusing to run.
+	script := testutil.Script(t, dir, "fail.sh", `echo "[start.sh] ERROR: the EULA is not accepted"; exit 3`)
+	def := valid(t, &servers.Definition{ID: "ff", Name: "FF", Backend: servers.BackendTmux,
+		Tmux: &servers.Tmux{Session: "instant-fail", SocketName: socket, Start: &servers.Command{Command: script}}})
+	b := newTmux(def, e.deps)
+	defer b.Close()
+	if err := b.Start(bg); err != nil {
+		t.Fatal(err)
+	}
+	var p Probe
+	testutil.Eventually(t, 5*time.Second, "the failed start to be detected", func() bool { p = b.Probe(bg); return p.Life == LifeDead })
+	if !strings.Contains(p.Detail, "exited with code 3") || p.Phase != PhaseFailed {
+		t.Fatalf("a non-zero exit code should be reported as a failure: %+v", p)
+	}
+	testutil.Eventually(t, 3*time.Second, "the error message in the console", func() bool { return e.has("[start.sh] ERROR: the EULA is not accepted") })
+	if out, err := exec.Command("tmux", "-L", socket, "has-session", "-t", "=instant-fail").CombinedOutput(); err == nil {
+		t.Fatalf("the finished session should have been removed: %s", out)
+	}
+	// It can be started again straight away.
+	if err := b.Start(bg); err != nil {
+		t.Fatalf("restart after a failure: %v", err)
+	}
+}
+
+func TestTmuxSingleCommandWithNologinShell(t *testing.T) {
+	// Under systemd, SHELL is the service account's login shell, typically
+	// /usr/sbin/nologin. A start command without arguments must still run.
+	e, socket := tmuxEnv(t)
+	nologin := "/usr/sbin/nologin"
+	if _, err := os.Stat(nologin); err != nil {
+		nologin = "/bin/false"
+	}
+	t.Setenv("SHELL", nologin)
+	dir := t.TempDir()
+	script := testutil.Script(t, dir, "srv.sh", `echo "single command up"; while read l; do echo "got: $l"; [ "$l" = stop ] && exit 0; done`)
+	def := valid(t, &servers.Definition{ID: "nl", Name: "NL", Backend: servers.BackendTmux,
+		Tmux: &servers.Tmux{Session: "nologin-shell", SocketName: socket, Start: &servers.Command{Command: script}, StopText: "stop"}})
+	b := newTmux(def, e.deps)
+	defer b.Close()
+	if err := b.Start(bg); err != nil {
+		t.Fatal(err)
+	}
+	testutil.Eventually(t, 5*time.Second, "output of the single-command server", func() bool { return e.has("single command up") })
+	if b.Probe(bg).Life != LifeAlive {
+		t.Fatal("the server should be running")
+	}
+	if err := b.Stop(bg, 5*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	var p Probe
+	testutil.Eventually(t, 5*time.Second, "graceful stop", func() bool { p = b.Probe(bg); return p.Life == LifeDead })
+	if p.Phase == PhaseFailed {
+		t.Fatalf("exit code 0 after a stop is not a failure: %+v", p)
+	}
+	if _, err := exec.Command("tmux", "-L", socket, "has-session", "-t", "=nologin-shell").CombinedOutput(); err == nil {
+		t.Fatal("a session whose server exited normally should be removed")
+	}
+}
+
+func TestTmuxKilledProcessIsAFailure(t *testing.T) {
+	e, socket := tmuxEnv(t)
+	dir := t.TempDir()
+	script := testutil.Script(t, dir, "crash.sh", `echo "running"; sleep 0.3; kill -KILL $$`)
+	def := valid(t, &servers.Definition{ID: "kc", Name: "KC", Backend: servers.BackendTmux,
+		Tmux: &servers.Tmux{Session: "killed-crash", SocketName: socket, Start: &servers.Command{Command: script}}})
+	b := newTmux(def, e.deps)
+	defer b.Close()
+	if err := b.Start(bg); err != nil {
+		t.Fatal(err)
+	}
+	var p Probe
+	testutil.Eventually(t, 5*time.Second, "the crash to be detected", func() bool { p = b.Probe(bg); return p.Life == LifeDead })
+	if p.Phase != PhaseFailed || !strings.Contains(p.Detail, "signal 9") {
+		t.Fatalf("a process killed by a signal is a failure: %+v", p)
+	}
+}

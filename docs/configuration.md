@@ -243,6 +243,9 @@ stops; `stop` shuts it down gracefully first.
   has not exited). If you start your server from a shell inside the session,
   the session outlives the server; add a readiness/status check or run the
   server as the session's command, as above.
+- When the program in a session the manager started exits, its last output
+  stays in the console, the exit code is shown (a non-zero code or a crash
+  is reported as ERROR) and the session is removed.
 - `start` is the command of a new detached session. Omit it for an
   **attach-only** session that something else starts: the manager then
   observes it, streams its output, sends commands and can stop it, but offers

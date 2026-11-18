@@ -1,0 +1,22 @@
+{
+  "id": "minecraft",
+  "name": "Minecraft",
+  "description": "Runs in a tmux session; the Java process runs as the gameserver user.",
+  "category": "Minecraft",
+  "backend": "tmux",
+  "tmux": {
+    "session": "minecraft",
+    "start": {
+      "command": "/usr/bin/sudo",
+      "args": ["-n", "-u", "gameserver", "/home/gameserver/minecraft/start.sh"]
+    },
+    "stop_text": "stop",
+    "kill_on_timeout": true
+  },
+  "readiness": {
+    "method": "console",
+    "console": { "pattern": "Done \\([0-9.]+s\\)! For help, type \"help\"", "regex": true },
+    "interval": "2s"
+  },
+  "timeouts": { "start": "5m", "stop": "2m", "command": "15s" }
+}

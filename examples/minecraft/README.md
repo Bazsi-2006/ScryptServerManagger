@@ -1,69 +1,66 @@
-# Minecraft server in tmux
+# Minecraft in tmux, running as the gameserver user
 
-Scripts for running a Minecraft Java server (vanilla, Paper, Purpur,
-Fabric, ...) with Server Manager's tmux backend:
+This setup runs a Minecraft server (vanilla, Paper, Fabric, ...) in a tmux
+session managed by Server Manager, while the Java process itself runs as a
+separate `gameserver` user:
 
-| File | Purpose |
+```text
+tmux session "minecraft"          owned by the Server Manager service user
+  -> sudo -n -u gameserver /home/gameserver/minecraft/start.sh
+       -> java -jar server.jar nogui   runs as gameserver, owns the world files
+```
+
+Server Manager never needs access to the Minecraft folder. It may run exactly
+one command as `gameserver`: the start script, without arguments.
+
+| File | Install as |
 |---|---|
-| `start.sh` | Runs inside the tmux session. Checks Java, the jar and the EULA, then starts the server. |
-| `backup.sh` | Consistent world backups: pauses saving, flushes, archives, resumes. Works with the server running or stopped. |
-| [`../servers/minecraft.json`](../servers/minecraft.json) | Matching server definition. |
-
-Server Manager creates the tmux session itself and runs `start.sh` in it, so
-the script does not start tmux. It replaces itself with Java, so when
-Minecraft stops, the session closes and the server shows as STOPPED.
+| [start.sh](start.sh) | `/home/gameserver/minecraft/start.sh` |
+| [sudoers](sudoers) | `/etc/sudoers.d/server-manager-minecraft` |
+| [minecraft.json](minecraft.json) | `<servers_dir>/minecraft.json`, or paste it into "Edit as JSON" in the web UI |
 
 ## Setup
 
-All commands below assume the server lives in `/opt/minecraft` and runs as
-the same user as Server Manager (that user must own the tmux session).
-
-1. Put the server jar in `/opt/minecraft` and name it `server.jar` (or set
-   `SERVER_JAR`). Minecraft 1.20.5 and newer need Java 21.
-2. Copy `start.sh` and `backup.sh` there and make them executable:
+1. Edit the settings block at the top of `start.sh` (folder, jar name,
+   memory, Java path). Then install it so that only `gameserver` (or root)
+   can change it:
 
    ```bash
-   chmod +x /opt/minecraft/start.sh /opt/minecraft/backup.sh
+   sudo install -m 0750 -o gameserver -g gameserver start.sh /home/gameserver/minecraft/start.sh
    ```
 
-3. Read the [Minecraft EULA](https://aka.ms/MinecraftEULA). If you agree:
+2. Allow the Server Manager service user to run it. Replace `server-manager`
+   in the file if your service user has another name:
 
    ```bash
-   echo eula=true > /opt/minecraft/eula.txt
+   sudo visudo -f /etc/sudoers.d/server-manager-minecraft
    ```
 
-4. Copy `minecraft.json` to `/etc/server-manager/servers/`, adjust paths and
-   memory, then use **Settings → Reload from disk** (or
-   `sudo systemctl reload server-manager`). You can also enter the same
-   values in the web form under **Servers → Add server**.
+3. Check the rule as the service user. It must print the script's own error
+   or start the server, not "a password is required":
 
-## Settings
+   ```bash
+   sudo -u server-manager sudo -n -u gameserver /home/gameserver/minecraft/start.sh
+   ```
 
-Set these in the definition's `"env"` section:
+   Stop it again with Ctrl+C if it started.
 
-| Variable | Default | Used by |
-|---|---|---|
-| `SERVER_JAR` | `server.jar` | start.sh |
-| `MIN_MEMORY` / `MAX_MEMORY` | `2G` / `4G` | start.sh (`-Xms` / `-Xmx`); leave memory for the OS |
-| `JAVA_BIN` | `java` | start.sh; full path to pick a specific Java version |
-| `EXTRA_JAVA_ARGS` | *(empty)* | start.sh; additional JVM flags |
-| `TMUX_SESSION` | `minecraft` | backup.sh; must equal `tmux.session` |
-| `WORLDS` | `world world_nether world_the_end` | backup.sh |
-| `KEEP_BACKUPS` | `14` | backup.sh; older archives are deleted |
-| `SAVE_TIMEOUT` | `120` | backup.sh; seconds to wait for "Saved the game" |
+4. Add the server definition (`minecraft.json`) in the web UI and start it.
 
-## How the pieces fit
+## What to expect
 
-- **Ready detection:** the server counts as RUNNING once the console shows
-  `Done (…s)! For help`.
-- **Stop:** Server Manager types `stop`. If the server is still running after
-  `timeouts.stop`, the session is killed.
-- **Console:** commands typed in the web console go straight to the server
-  console. Leave off the leading `/`, e.g. `say hello`.
-- **Backups:** **Create backup** runs `backup.sh`. Archives appear in the
-  Backups tab and can be downloaded there.
-- **Without Server Manager:** the scripts work on their own too:
+- STARTING until Minecraft prints `Done (…)! For help, type "help"`, then
+  RUNNING.
+- **Stop** types `stop` into the console; Minecraft saves the world and
+  exits. If it takes longer than 2 minutes, the session is killed.
+- Console commands are typed into the Minecraft console.
+- If the script refuses to start (EULA not accepted, jar missing, Java not
+  found, already running), its message appears in the console and the server
+  shows ERROR with the exit code.
+- If Minecraft crashes, the server shows ERROR.
+- Starting the script a second time by hand is refused while the server runs
+  (a lock file protects the world).
 
-  ```bash
-  tmux new-session -d -s minecraft /opt/minecraft/start.sh
-  ```
+Accept the EULA once before the first start: read
+https://aka.ms/MinecraftEULA and set `eula=true` in `eula.txt` in the server
+folder.

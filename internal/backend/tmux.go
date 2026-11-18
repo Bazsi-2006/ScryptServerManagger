@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode"
 
@@ -121,7 +122,17 @@ type paneInfo struct {
 	piped  bool
 	dead   bool
 	ident  string
+	// status is the exit code of a dead pane's process and signal the
+	// signal that killed it ("" if not applicable or unknown).
+	status string
+	signal string
+	// managed is true for sessions Server Manager created itself.
+	managed bool
 }
+
+// managedOption marks sessions created by Server Manager, so dead ones can be
+// cleaned up without touching sessions that belong to someone else.
+const managedOption = "@sm-managed"
 
 // windowTarget addresses the configured window (all of its panes).
 func (b *tmuxBackend) windowTarget() string { return "=" + b.t.Session + ":" + b.t.Window }
@@ -131,7 +142,7 @@ func (b *tmuxBackend) windowTarget() string { return "=" + b.t.Session + ":" + b
 // instead of printing empty values.
 func (b *tmuxBackend) paneInfo(ctx context.Context) (paneInfo, error) {
 	res, err := b.tmux(ctx, "list-panes", "-t", b.windowTarget(), "-F",
-		"#{pane_index} #{pane_active} #{pane_pipe} #{pane_dead} #{pane_id}/#{session_created}")
+		"#{pane_index}|#{pane_active}|#{pane_pipe}|#{pane_dead}|#{pane_id}/#{session_created}|#{pane_dead_status}|#{pane_dead_signal}|#{"+managedOption+"}")
 	if err != nil {
 		return paneInfo{}, err
 	}
@@ -142,13 +153,13 @@ func (b *tmuxBackend) paneInfo(ctx context.Context) (paneInfo, error) {
 		return paneInfo{}, fmt.Errorf("tmux: %s", res.stderr)
 	}
 	for _, line := range strings.Split(strings.TrimSpace(res.stdout), "\n") {
-		f := strings.Fields(line)
-		if len(f) != 5 {
+		f := strings.Split(line, "|")
+		if len(f) != 8 {
 			continue
 		}
 		// The configured pane index, or the window's active pane.
 		if (b.t.Pane != "" && f[0] == b.t.Pane) || (b.t.Pane == "" && f[1] == "1") {
-			return paneInfo{exists: true, piped: f[2] == "1", dead: f[3] == "1", ident: f[4]}, nil
+			return paneInfo{exists: true, piped: f[2] == "1", dead: f[3] == "1", ident: f[4], status: f[5], signal: f[6], managed: f[7] == "1"}, nil
 		}
 	}
 	return paneInfo{}, nil
@@ -166,10 +177,52 @@ func (b *tmuxBackend) Probe(ctx context.Context) Probe {
 		return Probe{Life: LifeDead}
 	}
 	if info.dead {
-		return Probe{Life: LifeDead, Detail: "the pane's process has exited (session kept by remain-on-exit)"}
+		if !info.managed {
+			return Probe{Life: LifeDead, Detail: "the pane's process has exited (session kept by remain-on-exit)"}
+		}
+		detail, failed := b.reapDeadSession(ctx, info)
+		p := Probe{Life: LifeDead, Detail: detail}
+		if failed {
+			p.Phase = PhaseFailed
+		}
+		return p
 	}
 	b.ensurePipe(ctx, info)
 	return Probe{Life: LifeAlive}
+}
+
+// reapDeadSession handles a session we created whose program has exited
+// (kept by remain-on-exit). Output that was not captured live - for example
+// because the manager was restarted in between - is loaded from the pane,
+// then the session is removed. It describes how the process ended and
+// whether that was a failure (non-zero exit code, or killed by a signal).
+func (b *tmuxBackend) reapDeadSession(ctx context.Context, info paneInfo) (string, bool) {
+	b.mu.Lock()
+	if b.attached != info.ident {
+		if lines, err := b.capture(ctx, b.deps.Config.Get().Console.BufferLines); err == nil {
+			for _, l := range lines {
+				b.deps.Console.Append(l)
+			}
+		}
+	}
+	b.attached = ""
+	b.mu.Unlock()
+	if _, err := b.tmux(ctx, "kill-session", "-t", b.sessionTarget()); err != nil {
+		b.deps.Log.Warn("could not remove finished tmux session", "server", b.def.ID, "error", err)
+	}
+	switch {
+	case info.signal != "":
+		desc := "the server process was killed by signal " + info.signal
+		if n, err := strconv.Atoi(info.signal); err == nil {
+			desc += " (" + syscall.Signal(n).String() + ")"
+		}
+		return desc, true
+	case info.status == "0":
+		return "the server process exited normally", false
+	case info.status != "":
+		return "the server process exited with code " + info.status, true
+	}
+	return "the server process exited", false
 }
 
 func shellQuote(s string) string {
@@ -291,12 +344,47 @@ func (b *tmuxBackend) Start(ctx context.Context) error {
 		return fmt.Errorf("executable %q was not found", b.t.Start.Command)
 	}
 
+	// The session is created around a placeholder process first. Before the
+	// real command runs, the pane is told to stay after its process exits
+	// and the output pipe is attached, so even a program that fails within
+	// milliseconds leaves its error message in the console. The placeholder
+	// and the real command are both given as separate arguments, which tmux
+	// executes directly, without going through the account's login shell
+	// (which is /usr/sbin/nologin for service accounts).
 	args := []string{"new-session", "-d", "-s", b.t.Session, "-x", strconv.Itoa(b.t.Width), "-y", strconv.Itoa(b.t.Height)}
 	if b.t.Window != "" && !isDigits(b.t.Window) {
 		args = append(args, "-n", b.t.Window)
 	}
+	args = append(args, "--", "sleep", "2147483647")
+	res, err := b.tmux(ctx, args...)
+	if err != nil {
+		return err
+	}
+	if res.code != 0 {
+		return fmt.Errorf("tmux could not create the session: %s", res.stderr)
+	}
+	fail := func(what string, res tmuxResult, err error) error {
+		_, _ = b.tmux(context.Background(), "kill-session", "-t", b.sessionTarget())
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("tmux could not %s: %s", what, res.stderr)
+	}
+	if res, err := b.tmux(ctx, "set-option", "-t", b.sessionTarget()+":", managedOption, "1"); err != nil || res.code != 0 {
+		return fail("mark the session", res, err)
+	}
+	if res, err := b.tmux(ctx, "set-window-option", "-t", b.windowTarget(), "remain-on-exit", "on"); err != nil || res.code != 0 {
+		return fail("configure the session", res, err)
+	}
+	info, err = b.paneInfo(ctx)
+	if err != nil || !info.exists {
+		return fail("find the new pane", tmuxResult{stderr: "pane not found"}, err)
+	}
+	b.ensurePipe(ctx, info)
+
+	respawn := []string{"respawn-pane", "-k", "-t", b.paneTarget()}
 	if b.def.WorkingDir != "" {
-		args = append(args, "-c", b.def.WorkingDir)
+		respawn = append(respawn, "-c", b.def.WorkingDir)
 	}
 	env := map[string]string{"SM_SERVER_ID": b.def.ID, "SM_SERVER_NAME": b.def.Name}
 	for k, v := range b.def.Env {
@@ -305,7 +393,7 @@ func (b *tmuxBackend) Start(ctx context.Context) error {
 	argv := b.t.Start.Argv()
 	if b.tmuxVersionAtLeast(ctx, 3, 2) {
 		for k, v := range env {
-			args = append(args, "-e", k+"="+v)
+			respawn = append(respawn, "-e", k+"="+v)
 		}
 	} else {
 		// Older tmux has no -e: wrap the command in env(1).
@@ -315,26 +403,15 @@ func (b *tmuxBackend) Start(ctx context.Context) error {
 		}
 		argv = append(wrapped, argv...)
 	}
-	args = append(args, "--")
 	if len(argv) == 1 {
-		// tmux passes a single argument to `sh -c`; several arguments are
-		// executed directly. Quote the lone program so both cases behave the
-		// same and nothing in the path is interpreted by the shell.
-		args = append(args, "exec "+shellQuote(argv[0]))
-	} else {
-		args = append(args, argv...)
+		// A single argument would be run through the login shell; pass it
+		// to /bin/sh as data instead, so nothing in the path is interpreted.
+		argv = []string{"/bin/sh", "-c", `exec "$0"`, argv[0]}
 	}
-	res, err := b.tmux(ctx, args...)
-	if err != nil {
-		return err
-	}
-	if res.code != 0 {
-		return fmt.Errorf("tmux could not create the session: %s", res.stderr)
-	}
-	// Attach the output pipe right away to keep the uncaptured window small;
-	// anything printed before this point is picked up from the pane history.
-	if info, err := b.paneInfo(ctx); err == nil && info.exists && !info.dead {
-		b.ensurePipe(ctx, info)
+	respawn = append(respawn, "--")
+	respawn = append(respawn, argv...)
+	if res, err := b.tmux(ctx, respawn...); err != nil || res.code != 0 {
+		return fail("start the command", res, err)
 	}
 	return nil
 }

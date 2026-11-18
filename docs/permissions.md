@@ -82,6 +82,11 @@ to it. Therefore:
 tmux still verifies the connecting user, so they do not by themselves give
 access to another user's sessions.
 
+To run the server process itself as another user while the manager keeps
+its own tmux sessions, make the tmux start command `sudo -n -u <user> <script>`
+and allow exactly that script in sudoers. A complete, tested example for
+Minecraft is in [examples/minecraft/](../examples/minecraft/README.md).
+
 Whoever may send console commands to a pane can type into it. If the pane is
 at a shell prompt, that is shell access as the session's user — grant
 CONSOLE_WRITE on such servers accordingly.
