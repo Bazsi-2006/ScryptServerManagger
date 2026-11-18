@@ -1,16 +1,38 @@
-# Caddy reverse proxy for Server Manager (automatic HTTPS).
+# Caddy reverse proxy for Server Manager.
 #
-# In config.json set:
-#   "listen": "127.0.0.1:8080"
-#   "public_url": "https://servers.example.com"
-#   "trusted_proxies": ["127.0.0.1/32", "::1/128"]
+# 1. Replace servers.example.com with your domain (its DNS A/AAAA record must
+#    point at this server; ports 80 and 443 must be open).
+# 2. In Server Manager's config.json:
+#      "listen": "127.0.0.1:8080"
+#      "public_url": "https://servers.example.com"
+#      "trusted_proxies": ["127.0.0.1/32", "::1/128"]     (the default)
+# 3. Install as /etc/caddy/Caddyfile, then: sudo systemctl reload caddy
+#
+# Caddy obtains and renews the HTTPS certificate automatically and redirects
+# plain HTTP to HTTPS. It passes the original Host header and sets
+# X-Forwarded-For / X-Forwarded-Proto, which Server Manager uses for its
+# origin check, secure cookies and client addresses. Security headers are set
+# by Server Manager itself; do not add them here as well.
 
 servers.example.com {
-	encode zstd gzip
+	# Compress pages and API responses, but never the two live streams
+	# (Server-Sent Events): a compressor may hold events back in its buffer,
+	# so status changes and console output would arrive late.
+	@compressible {
+		not path_regexp ^/api/v1/(events|servers/[^/]+/console/stream)$
+	}
+	encode @compressible zstd gzip
 
 	reverse_proxy 127.0.0.1:8080 {
-		# Deliver Server-Sent Events (live console, status updates)
-		# immediately instead of buffering them.
+		# Pass every write through immediately (live console, status updates).
 		flush_interval -1
+	}
+
+	# Optional access log; the application's own log is in the journal.
+	log {
+		output file /var/log/caddy/server-manager.log {
+			roll_size 10MiB
+			roll_keep 5
+		}
 	}
 }
