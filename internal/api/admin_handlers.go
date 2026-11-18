@@ -619,7 +619,7 @@ func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 		c.Auth.AccessTokenTTL, c.Auth.RefreshTokenTTL = req.Auth.AccessTokenTTL, req.Auth.RefreshTokenTTL
 		c.Auth.InvitationTTL, c.Auth.EmailChangeTTL = req.Auth.InvitationTTL, req.Auth.EmailChangeTTL
 		c.Auth.MinPasswordLength, c.Auth.CookieSecure = req.Auth.MinPasswordLength, req.Auth.CookieSecure
-		c.SMTP.Host, c.SMTP.Port, c.SMTP.Username = strings.TrimSpace(req.SMTP.Host), req.SMTP.Port, req.SMTP.Username
+		c.SMTP.Host, c.SMTP.Port, c.SMTP.Username = strings.TrimSpace(req.SMTP.Host), req.SMTP.Port, strings.TrimSpace(req.SMTP.Username)
 		c.SMTP.From, c.SMTP.TLS = strings.TrimSpace(req.SMTP.From), req.SMTP.TLS
 		c.CORS = req.CORS
 		c.RateLimits, c.Monitoring, c.Console, c.Backups = req.RateLimits, req.Monitoring, req.Console, req.Backups
