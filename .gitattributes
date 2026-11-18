@@ -1,0 +1,5 @@
+# Shell scripts and deployment files must keep Unix line endings, even when
+# the repository is checked out on Windows, or they fail on the server.
+*.sh text eol=lf
+deploy/* text eol=lf
+examples/scripts/* text eol=lf
