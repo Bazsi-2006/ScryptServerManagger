@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#0f1115">
+<meta name="referrer" content="no-referrer">
+<meta name="app-base" content="{{.Base}}">
+<title>{{.Title}}</title>
+<link rel="icon" href="{{index .Assets "favicon.svg"}}" type="image/svg+xml">
+<link rel="stylesheet" href="{{index .Assets "app.css"}}">
+<script src="{{index .Assets "app.js"}}" defer></script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <svg class="brand-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v9" /><path d="M6.3 6.3a8 8 0 1 0 11.4 0" /></svg>
+    <span>{{.Title}}</span>
+  </div>
+  <div class="account" id="account" hidden>
+    <span class="who" id="who"></span>
+    <button type="button" class="btn btn-ghost btn-small" id="logout">Sign out</button>
+  </div>
+</header>
+
+<main>
+  <noscript><p class="panel">This page needs JavaScript to work.</p></noscript>
+
+  <p class="loading" id="loading">Loading…</p>
+
+  <section class="login" id="login-view" hidden>
+    <form class="panel login-panel" id="login-form" novalidate>
+      <h1>Sign in</h1>
+      <p class="alert" id="login-error" role="alert" hidden></p>
+      <label for="username">Username</label>
+      <input id="username" name="username" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" maxlength="64" required>
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" maxlength="1024" required>
+      <button type="submit" class="btn btn-primary btn-block" id="login-submit">Sign in</button>
+    </form>
+  </section>
+
+  <section id="dashboard-view" hidden>
+    <div class="banner" id="banner" role="status" hidden></div>
+    <p class="empty panel" id="empty" hidden>No virtual machines are assigned to your account.</p>
+    <div class="grid" id="vms"></div>
+    <p class="updated" id="updated"></p>
+  </section>
+</main>
+
+<div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+<dialog class="panel confirm" id="confirm">
+  <form method="dialog">
+    <h2 id="confirm-title">Stop VM?</h2>
+    <p id="confirm-text">The guest operating system will be asked to shut down. Anyone using services on this VM will be disconnected.</p>
+    <div class="confirm-actions">
+      <button type="submit" class="btn btn-ghost" value="cancel" autofocus>Cancel</button>
+      <button type="submit" class="btn btn-danger" value="confirm" id="confirm-ok">Stop VM</button>
+    </div>
+  </form>
+</dialog>
+
+<template id="vm-card">
+  <article class="card">
+    <div class="card-head">
+      <h2 class="vm-name"></h2>
+      <span class="state"><span class="dot" aria-hidden="true"></span><span class="state-label"></span></span>
+    </div>
+    <p class="vm-desc"></p>
+    <p class="vm-message"></p>
+    <div class="actions">
+      <button type="button" class="btn btn-primary act-start">Start</button>
+      <button type="button" class="btn btn-danger-outline act-stop">Stop</button>
+      <a class="btn btn-ghost act-open" rel="noopener noreferrer">Open</a>
+    </div>
+  </article>
+</template>
+</body>
+</html>

@@ -1,0 +1,18 @@
+# Caddy: the VM controller on its own hostname (automatic HTTPS).
+#
+# vm-controller config.json for this setup:
+#   "listen": "127.0.0.1:8090",
+#   "base_path": "/",
+#   "trusted_proxies": ["127.0.0.1/32", "::1/128"]
+#
+# Caddy replaces any X-Forwarded-For / X-Forwarded-Proto sent by the client
+# with its own values (unless you configure Caddy's own trusted_proxies), so
+# vm-controller can safely trust the headers it receives from 127.0.0.1.
+
+vmctl.example.com {
+	encode zstd gzip
+
+	header Strict-Transport-Security "max-age=31536000"
+
+	reverse_proxy 127.0.0.1:8090
+}

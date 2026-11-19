@@ -118,6 +118,14 @@ scripts/                build and install helpers
 docs/                   documentation
 ```
 
+## Companion: VM Controller
+
+[`vm-controller/`](vm-controller/README.md) is a separate, much smaller
+application in its own Go module. It lets authenticated users start and
+gracefully stop selected Vexa-VM virtual machines. It can also serve as a
+Caddy fallback page when the VM that runs this Server Manager is switched off.
+It builds and deploys independently of Server Manager.
+
 ## What it deliberately does not do
 
 It does not install or update game servers, speak game-specific protocols,

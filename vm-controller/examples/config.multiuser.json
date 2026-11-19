@@ -1,0 +1,65 @@
+{
+  "mode": "multiuser",
+  "title": "Game Servers",
+  "listen": "127.0.0.1:8090",
+  "base_path": "/vmctl",
+  "database": "/var/lib/vm-controller/vm-controller.db",
+  "cookie_secure": "auto",
+  "trusted_proxies": ["127.0.0.1/32", "::1/128"],
+  "session": {
+    "lifetime_hours": 12,
+    "idle_timeout_minutes": 120
+  },
+  "vexa": {
+    "base_url": "http://127.0.0.1:8080",
+    "api_key_file": "/etc/vm-controller/vexa-api-key",
+    "timeout_seconds": 10,
+    "status_cache_seconds": 5,
+    "start_timeout_seconds": 180,
+    "stop_timeout_seconds": 420,
+    "track_jobs": false
+  },
+  "vms": [
+    {
+      "id": "3f1c9a2e-5b7d-4e8f-9a0b-1c2d3e4f5a61",
+      "name": "Minecraft VM 1",
+      "description": "Survival and creative worlds",
+      "allow_stop": false,
+      "url": "/"
+    },
+    {
+      "id": "8d2e4b6a-1c3f-4a5b-8c7d-9e0f1a2b3c42",
+      "name": "Minecraft VM 2",
+      "description": "Modded server",
+      "allow_stop": true
+    }
+  ],
+  "users": [
+    {
+      "username": "alice",
+      "permissions": {
+        "3f1c9a2e-5b7d-4e8f-9a0b-1c2d3e4f5a61": "start"
+      }
+    },
+    {
+      "username": "bob",
+      "permissions": {
+        "8d2e4b6a-1c3f-4a5b-8c7d-9e0f1a2b3c42": "start-stop"
+      }
+    },
+    {
+      "username": "charlie",
+      "permissions": {
+        "3f1c9a2e-5b7d-4e8f-9a0b-1c2d3e4f5a61": "start",
+        "8d2e4b6a-1c3f-4a5b-8c7d-9e0f1a2b3c42": "start"
+      }
+    },
+    {
+      "username": "dave",
+      "disabled": true,
+      "permissions": {
+        "8d2e4b6a-1c3f-4a5b-8c7d-9e0f1a2b3c42": "start"
+      }
+    }
+  ]
+}

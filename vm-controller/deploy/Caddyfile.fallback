@@ -1,0 +1,90 @@
+# Caddy: the VM controller as a fallback for a service that runs inside a VM.
+#
+# games.example.com normally serves the game-server manager running inside a
+# VM (10.0.0.5:8080 here). When that VM is off, or the manager is not
+# answering, browsers are redirected to the VM controller under /vmctl/,
+# where users can sign in and start the VM. Once the manager answers again,
+# games.example.com serves it again.
+#
+# vm-controller config.json for this setup:
+#   "listen": "127.0.0.1:8090",
+#   "base_path": "/vmctl",
+#   "trusted_proxies": ["127.0.0.1/32", "::1/128"]
+# and on the manager's VM entry:
+#   "url": "/"            (shows an "Open" button while the VM runs)
+#
+# Requires Caddy 2.6 or newer. Read the "Caddy" section of the README for the
+# limitations of this approach.
+
+games.example.com {
+	encode zstd gzip
+
+	header Strict-Transport-Security "max-age=31536000"
+
+	# 1. The controller owns /vmctl and everything below it. These requests
+	#    always go to the controller and never to the manager, so its login,
+	#    session cookie (Path=/vmctl) and API stay separate from the manager.
+	handle /vmctl* {
+		reverse_proxy 127.0.0.1:8090
+	}
+
+	# 2. Everything else is the game-server manager inside the VM.
+	handle {
+		reverse_proxy 10.0.0.5:8080 {
+			# Fail fast when the VM is off instead of waiting for the
+			# operating system's connect timeout.
+			transport http {
+				dial_timeout 3s
+			}
+
+			# Active health check (optional, recommended): while the
+			# manager is known to be down, Caddy answers immediately with
+			# 503 instead of trying to connect on every request. Point
+			# health_uri at a cheap page of the manager; the Server
+			# Manager in this repository serves /api/v1/health.
+			health_uri /api/v1/health
+			health_interval 10s
+			health_timeout 3s
+			health_status 2xx
+
+			# Server-Sent Events of the manager are delivered unbuffered.
+			flush_interval -1
+		}
+	}
+
+	# 3. reverse_proxy reports "cannot reach the upstream" as 502 (connection
+	#    refused or timed out) or 503 (no healthy upstream). Only these
+	#    Caddy-generated errors reach handle_errors; an error page that the
+	#    manager itself returns is passed through unchanged.
+	handle_errors {
+		# Page loads outside /vmctl are sent to the controller. Excluding
+		# /vmctl prevents a redirect loop when the controller itself is
+		# down.
+		@manager_down {
+			expression `{err.status_code} in [502, 503, 504]`
+			method GET HEAD
+			not path /vmctl*
+		}
+		handle @manager_down {
+			header Cache-Control "no-store"
+			redir * /vmctl/ 302
+		}
+
+		# Anything else (API calls of an already open manager page, or the
+		# controller being down) gets a plain error.
+		handle {
+			header Cache-Control "no-store"
+			respond "{err.status_code} {err.status_text}" {err.status_code}
+		}
+	}
+}
+
+# Stronger isolation: serve the controller on its own subdomain (see
+# Caddyfile.standalone) and redirect there instead:
+#
+#	handle @manager_down {
+#		redir * https://vmctl.example.com/ 302
+#	}
+#
+# With a separate origin, a cross-site scripting bug in the manager cannot be
+# used to act on the controller (see README, "Same-origin hosting").
