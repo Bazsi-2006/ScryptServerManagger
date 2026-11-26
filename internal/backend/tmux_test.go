@@ -160,3 +160,59 @@ func TestTmuxAttachOnlyAndMissingBinary(t *testing.T) {
 		t.Fatalf("missing tmux binary: %+v", p)
 	}
 }
+
+func TestTmuxSendTextForBackupsAndActions(t *testing.T) {
+	e, socket := tmuxEnv(t)
+	dir := t.TempDir()
+	script := testutil.Script(t, dir, "srv.sh", `while read line; do echo "got: $line"; done`)
+	// Console input is deliberately "none": predefined text does not depend
+	// on users being allowed to type into the console.
+	def := valid(t, &servers.Definition{ID: "st", Name: "ST", Backend: servers.BackendTmux,
+		Console: servers.Console{Input: servers.InputNone},
+		Tmux:    &servers.Tmux{Session: "sendtext", SocketName: socket, Start: &servers.Command{Command: script}}})
+	b := newTmux(def, e.deps)
+	defer b.Close()
+	var ts TextSender = b
+
+	err := ts.SendText(bg, "/backup start", true)
+	if !errors.Is(err, ErrNotRunning) || !strings.Contains(err.Error(), `"sendtext" does not exist`) {
+		t.Fatalf("missing session must be reported clearly: %v", err)
+	}
+	if err := b.Start(bg); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.SendInput(bg, "x"); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("console input is off for this server: %v", err)
+	}
+	// Typed literally, followed by Enter.
+	if err := ts.SendText(bg, "/backup start; $(id) C-c", true); err != nil {
+		t.Fatal(err)
+	}
+	testutil.Eventually(t, 5*time.Second, "backup command in the console", func() bool { return e.has("got: /backup start; $(id) C-c") })
+	if b.Probe(bg).Life != LifeAlive {
+		t.Fatal(`"C-c" in the text must not be pressed as a key`)
+	}
+	// Without Enter the text waits in the prompt until Enter comes.
+	if err := ts.SendText(bg, "save-all", false); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if e.has("got: save-all") {
+		t.Fatal("Enter was pressed although it was not requested")
+	}
+	if err := ts.SendText(bg, " flush", true); err != nil {
+		t.Fatal(err)
+	}
+	testutil.Eventually(t, 5*time.Second, "completed line", func() bool { return e.has("got: save-all flush") })
+	for _, bad := range []string{"a\nb", "x\x03", "tab\there"} {
+		if err := ts.SendText(bg, bad, true); err == nil {
+			t.Errorf("control characters in %q must be rejected", bad)
+		}
+	}
+	if err := b.Kill(bg); err != nil {
+		t.Fatal(err)
+	}
+	if err := ts.SendText(bg, "late", true); !errors.Is(err, ErrNotRunning) {
+		t.Fatalf("after the session ended: %v", err)
+	}
+}

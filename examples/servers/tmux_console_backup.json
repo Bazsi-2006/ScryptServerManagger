@@ -1,0 +1,34 @@
+{
+  "id": "tmux_console_backup",
+  "name": "Game server with console backups",
+  "description": "A server that makes backups from its own console. Create backup types \"/backup start\" into the tmux session and waits for the server to print \"Backup complete\"; without the completion pattern the backup would be reported as submitted.",
+  "category": "other",
+  "backend": "tmux",
+  "working_dir": "/opt/gameservers/example",
+  "tmux": {
+    "session": "example-game",
+    "start": { "command": "/opt/gameservers/example/run.sh" },
+    "stop_text": "/stop",
+    "kill_on_timeout": true
+  },
+  "readiness": {
+    "method": "console",
+    "console": { "pattern": "Server started" }
+  },
+  "backup": {
+    "method": "tmux",
+    "directory": "/opt/gameservers/example/backups",
+    "tmux": { "text": "/backup start", "enter": true },
+    "completion": { "pattern": "Backup complete" }
+  },
+  "actions": [
+    {
+      "id": "announce_restart",
+      "name": "Announce restart",
+      "description": "Warns players that the server restarts in five minutes.",
+      "method": "tmux",
+      "tmux": { "text": "/say Server restart in 5 minutes", "enter": true }
+    }
+  ],
+  "timeouts": { "start": "3m", "stop": "1m", "backup": "20m" }
+}

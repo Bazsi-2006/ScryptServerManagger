@@ -4,7 +4,7 @@
 
 import * as api from '../api.js';
 import * as store from '../store.js';
-import { h, replace, field, withBusy, notify, errorMessage } from '../ui.js';
+import { h, replace, field, withBusy, notify, errorMessage, openModal, chip, confirmDialog } from '../ui.js';
 
 const clone = (v) => JSON.parse(JSON.stringify(v));
 
@@ -31,7 +31,7 @@ export function setPath(obj, path, value) {
 
 export function blankDefinition() {
   return {
-    id: '', name: '', description: '', category: '', backend: 'custom', working_dir: '', env: {},
+    id: '', name: '', description: '', category: '', backend: 'custom', working_dir: '',
     custom: { mode: 'foreground', start: { command: '', args: [] } },
     readiness: { method: 'none', interval: '2s' },
     console: {},
@@ -39,18 +39,112 @@ export function blankDefinition() {
   };
 }
 
-const envToText = (env) => Object.entries(env || {}).map(([k, v]) => `${k}=${v}`).join('\n');
+// Environment variables are no longer edited in the form (set them in your
+// start scripts or service configuration). Existing values in a definition
+// are kept untouched, and the JSON view still shows them.
 
-function textToEnv(text) {
-  const env = {};
-  for (const raw of text.split('\n')) {
-    const line = raw.trim();
-    if (!line) continue;
-    const i = line.indexOf('=');
-    if (i <= 0) throw new Error(`Environment line "${line}" must look like NAME=value.`);
-    env[line.slice(0, i).trim()] = line.slice(i + 1);
+/** Category choices: managed categories plus the current unmanaged value. */
+function categorySelect(d, disabled, onChange) {
+  const input = h('select', { disabled });
+  const fill = (cats, unmanaged) => {
+    const cur = d.category || '';
+    const opts = [h('option', { value: '' }, 'No category')];
+    let found = cur === '';
+    for (const c of cats) {
+      const match = c.id === cur || c.name.toLowerCase() === cur.toLowerCase();
+      if (match) found = true;
+      opts.push(h('option', { value: c.id, selected: match }, c.limit ? `${c.name} (max ${c.limit} running)` : c.name));
+    }
+    for (const v of unmanaged) {
+      if (v === cur || cats.some((c) => c.name.toLowerCase() === v.toLowerCase())) continue;
+      opts.push(h('option', { value: v }, `${v} (not managed)`));
+    }
+    if (!found) opts.push(h('option', { value: cur, selected: true }, `${cur} (not managed)`));
+    replace(input, opts);
+    input.value = found ? (cats.find((c) => c.id === cur || c.name.toLowerCase() === cur.toLowerCase())?.id ?? cur) : cur;
+    if (input.value !== cur && !disabled) onChange(input.value);
+  };
+  fill([], []);
+  if (store.isAdmin()) {
+    api.get('/admin/categories').then((res) => fill(res.capacity.categories, res.unmanaged.map((u) => u.value))).catch(() => {});
   }
-  return env;
+  input.addEventListener('change', () => onChange(input.value));
+  return input;
+}
+
+/** Modal editor for one custom action. */
+function actionDialog({ action, backend, existingIds, onSave }) {
+  const isNew = !action;
+  const a = action ? clone(action) : { id: '', name: '', method: backend === 'tmux' ? 'tmux' : 'command', command: { command: '', args: [] }, tmux: { text: '', enter: true }, confirm: false };
+  a.command = a.command || { command: '', args: [] };
+  a.tmux = a.tmux || { text: '', enter: true };
+  const id = h('input', { type: 'text', value: a.id, placeholder: 'save_world', spellcheck: 'false', autocapitalize: 'none', disabled: !isNew });
+  const name = h('input', { type: 'text', value: a.name, placeholder: 'Save World', maxlength: 100 });
+  const icon = h('input', { type: 'text', value: a.icon || '', placeholder: '💾', maxlength: 8 });
+  const desc = h('textarea', { rows: 2, value: a.description || '', maxlength: 500 });
+  const methods = [['command', 'Run a script or program']];
+  if (backend === 'tmux') methods.push(['tmux', 'Send a command to the tmux session']);
+  const method = h('select', null, methods.map(([v, l]) => h('option', { value: v, selected: v === a.method }, l)));
+  const cmd = h('input', { type: 'text', value: a.command.command, placeholder: '/opt/servers/example/update.sh', spellcheck: 'false' });
+  const args = h('textarea', { rows: 3, class: 'code', spellcheck: 'false', value: (a.command.args || []).join('\n') });
+  const wd = h('input', { type: 'text', value: a.working_dir || '', placeholder: 'Server working directory', spellcheck: 'false' });
+  const timeout = h('input', { type: 'text', value: a.timeout || '10m0s', spellcheck: 'false' });
+  const text = h('input', { type: 'text', value: a.tmux.text, placeholder: 'save-all flush', spellcheck: 'false', class: 'code' });
+  const enter = h('input', { type: 'checkbox', checked: a.tmux.enter !== false });
+  const confirm = h('input', { type: 'checkbox', checked: !!a.confirm });
+  const enabled = h('input', { type: 'checkbox', checked: !a.disabled });
+  const cmdPart = h('div', null,
+    field('Executable', cmd, 'Absolute path, or a program name found in PATH. Run directly, never through a shell.'),
+    field('Arguments', args, 'One argument per line, passed exactly as written.'),
+    h('div', { class: 'field-row' }, field('Working directory (optional)', wd, 'Absolute path; defaults to the server\'s working directory.'), field('Timeout', timeout, 'The command is killed after this, e.g. 30s or 10m.')));
+  const tmuxPart = h('div', null,
+    field('Command text', text, 'Typed literally into the server\'s tmux session; no shell is involved.'),
+    field('Press Enter after the text', enter, null, { inline: true }));
+  const errors = h('div', { class: 'alert alert-error', hidden: true });
+  const sync = () => { cmdPart.hidden = method.value !== 'command'; tmuxPart.hidden = method.value !== 'tmux'; };
+  method.addEventListener('change', sync);
+  sync();
+  const save = h('button', { class: 'btn btn-primary', type: 'button' }, isNew ? 'Add action' : 'Apply');
+  const m = openModal({
+    title: isNew ? 'New custom action' : `Edit ${a.name}`, wide: true,
+    body: h('div', { class: 'form' }, errors,
+      h('div', { class: 'field-row' },
+        field('Action ID', id, 'Permanent: lowercase letters, digits, "_" and "-".'),
+        field('Name', name),
+        field('Icon (optional)', icon, 'A short symbol, e.g. an emoji.')),
+      field('Description (optional)', desc, 'Shown to users on the action button.'),
+      field('Execution method', method),
+      cmdPart, tmuxPart,
+      field('Ask for confirmation before running', confirm, null, { inline: true }),
+      field('Enabled', enabled, 'Disabled actions are hidden from users and cannot run.', { inline: true })),
+    footer: [h('button', { class: 'btn', type: 'button', onclick: () => m.close() }, 'Cancel'), save],
+  });
+  save.addEventListener('click', () => {
+    const out = { id: id.value.trim(), name: name.value.trim(), method: method.value, confirm: confirm.checked };
+    if (icon.value.trim()) out.icon = icon.value.trim();
+    if (desc.value.trim()) out.description = desc.value.trim();
+    if (!enabled.checked) out.disabled = true;
+    if (out.method === 'command') {
+      out.command = { command: cmd.value.trim(), args: args.value.split('\n').filter((l) => l !== '') };
+      if (wd.value.trim()) out.working_dir = wd.value.trim();
+      if (timeout.value.trim()) out.timeout = timeout.value.trim();
+    } else {
+      out.tmux = { text: text.value, enter: enter.checked };
+    }
+    const problems = [];
+    if (!/^[a-z0-9][a-z0-9_-]{0,62}$/.test(out.id)) problems.push('The action ID must be lowercase letters, digits, "_" or "-".');
+    else if (isNew && existingIds.includes(out.id)) problems.push('Another action already uses this ID.');
+    if (!out.name) problems.push('A name is required.');
+    if (out.method === 'command' && !out.command.command) problems.push('The executable is required.');
+    if (out.method === 'tmux' && !out.tmux.text.trim()) problems.push('The command text is required.');
+    if (problems.length) {
+      replace(errors, h('ul', null, problems.map((p) => h('li', null, p))));
+      errors.hidden = false;
+      return;
+    }
+    onSave(out);
+    m.close();
+  });
 }
 
 /**
@@ -237,20 +331,18 @@ export function serverForm({ def, scope, isNew, onSave, onCancel }) {
     if (jsonMode) {
       jsonArea.value = JSON.stringify(d, null, 2);
       jsonArea.disabled = safeOnly;
-      replace(body, h('p', { class: 'hint' }, 'The complete definition as JSON. This is exactly what is stored in the server\'s definition file.'), jsonArea);
+      replace(body, h('p', { class: 'hint' }, 'The complete definition as JSON. This is exactly what is stored in the server\'s definition file. Environment variables, if a definition has any, can only be edited here.'), jsonArea);
       return;
     }
     ensure('timeouts', {});
-    const envArea = h('textarea', { rows: 3, class: 'code', spellcheck: 'false', value: envToText(d.env), placeholder: 'JAVA_OPTS=-Xmx4G', disabled: safeOnly });
-    envArea.addEventListener('input', () => { envArea.dataset.dirty = '1'; });
-    envArea.id = 'env-area';
     replace(body,
       section('General', null,
         row(
           isNew ? text('id', 'Server ID', 'Permanent identifier: lowercase letters, digits, "_" and "-".', { placeholder: 'minecraft_survival' })
             : field('Server ID', h('input', { type: 'text', value: d.id, disabled: true })),
           text('name', 'Display name', null, { safe: true }),
-          text('category', 'Category (optional)', 'Groups servers on the dashboard.', { safe: true })),
+          field('Category', categorySelect(d, !store.isAdmin(), (v) => { d.category = v; }),
+            store.isAdmin() ? 'Groups servers and decides which concurrency limit applies. Manage categories under Limits.' : 'Set by an administrator.', { name: 'category' })),
         area('description', 'Description (optional)', null, { safe: true }),
         row(
           select('backend', 'Execution backend', [['custom', 'Custom scripts / commands'], ['tmux', 'tmux session'], ['systemd', 'systemd service'], ['docker', 'Docker container']], null, { rerender: true }),
@@ -258,13 +350,8 @@ export function serverForm({ def, scope, isNew, onSave, onCancel }) {
       backendSection(),
       readinessSection(),
       consoleSection(),
-      section('Environment variables', 'One NAME=value per line. Passed to every command of this server. Values shown as ******** are hidden and kept unchanged.',
-        field('Variables', envArea, null, { name: 'env' })),
-      section('Backups', 'Optional. The backup command is run on request; files in the backup directory can be listed and downloaded.',
-        row(
-          text('backup.directory', 'Backup directory', 'Absolute path. Downloads are restricted to this directory.'),
-          check('backup.allow_user_delete', 'Users with the BACKUPS permission may delete backup files')),
-        command('backup.command', 'Backup command (optional)', 'Receives SM_SERVER_ID and SM_BACKUP_DIR in its environment.')),
+      backupSection(),
+      actionsSection(),
       section('Timeouts and limits', 'Durations such as 30s, 2m or 1h.',
         row(
           text('timeouts.start', 'Start timeout', null, { safe: true }),
@@ -276,13 +363,69 @@ export function serverForm({ def, scope, isNew, onSave, onCancel }) {
           text('status_poll_interval', 'Status check interval (optional)', 'Overrides the global setting.', { safe: true, optional: true }))));
   }
 
+  function backupSection() {
+    const method = getPath(d, 'backup.method') || 'command';
+    const tmux = d.backend === 'tmux';
+    const methods = [['command', 'Run a backup script or program']];
+    if (tmux || method === 'tmux') methods.push(['tmux', 'Send command to tmux session']);
+    const parts = [
+      row(select('backup.method', 'Backup method', methods, tmux ? 'Game servers that back up from their own console can be sent a command instead of running a script.' : null, { def: 'command', rerender: true }),
+        check('backup.allow_user_delete', 'Users with BACKUP_DOWNLOAD may delete backup files')),
+    ];
+    if (method === 'tmux') {
+      ensure('backup.tmux', { text: '', enter: true });
+      parts.push(
+        row(text('backup.directory', 'Backup directory (optional)', 'Where the server writes its backups. Files here can be listed and downloaded, and new ones are picked up automatically.'),
+          text('backup.tmux.text', 'Command sent to the console', 'Typed literally into the tmux session, e.g. /backup start.')),
+        row(check('backup.tmux.enter', 'Press Enter after the command', null, { def: true }),
+          text('backup.completion.pattern', 'Completion text (optional)', 'If the server prints a line when the backup is done, the operation waits for it. Without it, the backup is reported as "submitted": the command was sent, but completion cannot be verified.', { optional: true }),
+          check('backup.completion.regex', 'Completion text is a regular expression')));
+    } else {
+      parts.push(
+        text('backup.directory', 'Backup directory', 'Absolute path. Downloads are restricted to this directory.'),
+        command('backup.command', 'Backup command (optional)', 'Receives SM_SERVER_ID and SM_BACKUP_DIR in its environment.'));
+    }
+    return section('Backups', 'Optional. Backups run on request; files in the backup directory can be listed and downloaded.', ...parts);
+  }
+
+  function actionsSection() {
+    // Custom actions are managed by administrators only; the server never
+    // shows them to anyone else.
+    if (safeOnly || !store.isAdmin()) return null;
+    const list = d.actions || [];
+    const edit = (index) => actionDialog({
+      action: index === undefined ? null : list[index], backend: d.backend, existingIds: list.map((a) => a.id),
+      onSave: (a) => {
+        const next = [...list];
+        if (index === undefined) next.push(a); else next[index] = a;
+        d.actions = next;
+        render();
+      },
+    });
+    const rows = list.map((a, i) => h('div', { class: 'action-row' },
+      h('div', { class: 'action-row-main' },
+        h('strong', null, (a.icon ? a.icon + ' ' : '') + a.name), h('span', { class: 'muted small' }, ` ${a.id}`),
+        chip(a.method === 'tmux' ? 'tmux command' : 'script', a.method === 'tmux' ? 'chip-backend' : ''),
+        a.confirm ? chip('confirmation', '') : null, a.disabled ? chip('disabled', 'chip-warn') : null,
+        h('div', { class: 'muted small break' }, a.method === 'tmux' ? `Sends: ${a.tmux?.text || ''}${a.tmux?.enter === false ? '' : ' ⏎'}` : `Runs: ${[a.command?.command, ...(a.command?.args || [])].join(' ')}`)),
+      h('div', { class: 'action-row-buttons' },
+        h('button', { class: 'btn btn-small', type: 'button', onclick: () => edit(i) }, 'Edit'),
+        h('button', { class: 'btn btn-small btn-danger', type: 'button', onclick: async () => {
+          const ok = await confirmDialog({ title: `Remove "${a.name}"?`, message: 'The action and every permission granted for it are removed when you save the server settings.', confirmLabel: 'Remove', danger: true });
+          if (!ok) return;
+          d.actions = list.filter((_, j) => j !== i);
+          render();
+        } }, 'Remove'))));
+    return section('Custom actions', 'Buttons that run a predefined script or send a predefined command to the server console. Users can only run the actions you grant them in the Access tab, and never change what they execute. Changes are saved with the settings below.',
+      rows.length ? rows : h('p', { class: 'muted' }, 'No custom actions yet.'),
+      h('div', null, h('button', { class: 'btn btn-small', type: 'button', onclick: () => edit(undefined) }, '+ Add action')));
+  }
+
   function collect() {
     if (jsonMode) {
       try { d = JSON.parse(jsonArea.value); } catch (err) { throw new Error('The JSON is not valid: ' + err.message); }
       return d;
     }
-    const envArea = body.querySelector('#env-area');
-    if (envArea && envArea.dataset.dirty) d.env = textToEnv(envArea.value);
     return d;
   }
 
@@ -296,7 +439,7 @@ export function serverForm({ def, scope, isNew, onSave, onCancel }) {
 
   const saveBtn = h('button', { type: 'submit', class: 'btn btn-primary' }, isNew ? 'Create server' : 'Save changes');
   const form = h('form', { class: 'form server-form', novalidate: true },
-    safeOnly ? h('div', { class: 'alert alert-info' }, 'You can edit the name, description, category, timeouts and console readiness text. Execution settings can only be changed by an administrator.') : null,
+    safeOnly ? h('div', { class: 'alert alert-info' }, 'You can edit the name, description, timeouts and console readiness text. Execution settings, the category and custom actions can only be changed by an administrator.') : null,
     h('div', { class: 'form-toolbar' }, modeBtn),
     errors, body,
     h('div', { class: 'form-actions' }, saveBtn, onCancel ? h('button', { type: 'button', class: 'btn', onclick: onCancel }, 'Cancel') : null));

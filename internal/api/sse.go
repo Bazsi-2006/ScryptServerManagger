@@ -84,7 +84,11 @@ func (s *Server) ResolveIdentity(userID int64, sessionID string) (events.Identit
 	for k, v := range raw {
 		perms[k] = perm.Mask(v)
 	}
-	return events.Identity{UserID: userID, SessionID: sessionID, IsAdmin: u.IsAdmin, Perms: perms}, true
+	actions, err := s.Store.ActionPermissionsForUser(ctx, userID)
+	if err != nil {
+		return events.Identity{}, false
+	}
+	return events.Identity{UserID: userID, SessionID: sessionID, IsAdmin: u.IsAdmin, Perms: perms, Actions: actions}, true
 }
 
 // handleEvents is the application-wide event stream. Authentication uses

@@ -48,6 +48,26 @@ const (
 
 	SettingsUpdate = "SETTINGS_UPDATE"
 	ServersReload  = "SERVERS_RELOAD"
+
+	// Custom actions.
+	ActionRun              = "ACTION_RUN"
+	ActionCreate           = "ACTION_CREATE"
+	ActionUpdate           = "ACTION_UPDATE"
+	ActionDelete           = "ACTION_DELETE"
+	ActionPermissionChange = "ACTION_PERMISSION_CHANGE"
+
+	// Categories and concurrency limits.
+	CategoryCreate = "CATEGORY_CREATE"
+	CategoryUpdate = "CATEGORY_UPDATE"
+	CategoryDelete = "CATEGORY_DELETE"
+	LimitOverride  = "LIMIT_OVERRIDE"
+	LimitDenied    = "LIMIT_DENIED"
+
+	// Email verification, notifications and password reset.
+	EmailVerifyRequest      = "EMAIL_VERIFY_REQUEST"
+	NotificationPrefsUpdate = "NOTIFICATION_PREFS_UPDATE"
+	PasswordResetRequest    = "PASSWORD_RESET_REQUEST"
+	PasswordReset           = "PASSWORD_RESET"
 )
 
 // Results.
@@ -56,6 +76,9 @@ const (
 	Failure   = "FAILURE"
 	Denied    = "DENIED"
 	Requested = "REQUESTED"
+	// Submitted: a command was delivered to a server console (tmux), but
+	// its effect cannot be verified.
+	Submitted = "SUBMITTED"
 )
 
 // Actor identifies who performed an action. The zero value means "system".

@@ -16,10 +16,14 @@ info:
 
     **Authorization.** Administrators may do everything. Other users hold a
     bitmask per server: START=1, STOP=2 (implies START), CONSOLE_READ=4,
-    CONSOLE_WRITE=8 (implies CONSOLE_READ), BACKUPS=16, CONFIG=32. A server
-    the caller has no permission for answers `404`, exactly like a server
-    that does not exist; a visible server without the specific permission
-    answers `403`.
+    CONSOLE_WRITE=8 (implies CONSOLE_READ), CONFIG=32, BACKUP_CREATE=64,
+    BACKUP_DOWNLOAD=128. Bit 16 is the former general BACKUPS permission:
+    it is still accepted and stored as BACKUP_CREATE|BACKUP_DOWNLOAD. A
+    server the caller has no permission for answers `404`, exactly like a
+    server that does not exist; a visible server without the specific
+    permission answers `403`. Custom actions are granted individually per
+    user (`PUT /admin/users/{uid}/actions/{id}/{aid}`) and need access to
+    the server, but no other permission.
 
     **Errors.** Every error has the shape `{"error": {"code", "message",
     "details"?}}`. Codes distinguish the cause:
@@ -30,7 +34,7 @@ info:
     | 401 | `unauthenticated`, `token_expired`, `invalid_credentials` | not signed in |
     | 403 | `permission_denied`, `csrf_rejected`, `account_disabled` | missing permission |
     | 404 | `not_found` | unknown or invisible resource |
-    | 409 | `already_running`, `not_running`, `operation_in_progress`, `server_active`, `unsupported_action`, `already_exists` | conflict with current state |
+    | 409 | `already_running`, `not_running`, `operation_in_progress`, `server_active`, `unsupported_action`, `already_exists`, `concurrency_limit`, `action_running`, `action_disabled`, `confirmation_required` | conflict with current state |
     | 413 | `request_too_large`, `download_too_large` | size limit |
     | 422 | `validation_failed` | invalid configuration (details list fields) |
     | 429 | `rate_limited`, `cooldown` | slow down (`Retry-After`) |
@@ -41,9 +45,17 @@ info:
     A server whose state cannot be determined is not an error response: its
     status carries the state `UNKNOWN` and a message.
 
-    **Asynchronous operations.** Start, stop, restart and backup return
-    `202 Accepted` at once. Follow progress through `GET
-    /servers/{id}/status` or the event stream.
+    **Asynchronous operations.** Start, stop, restart, backup and custom
+    action runs return `202 Accepted` at once. Follow progress through `GET
+    /servers/{id}/status` or the event stream. Operation outcomes are
+    `succeeded`, `failed`, `cancelled`, `interrupted` or `submitted` (text
+    was delivered to a tmux console; its effect cannot be verified).
+
+    **Concurrency limits.** A start or restart of a stopped server is
+    refused with `409 concurrency_limit` when the global limit or the
+    server's category limit is reached (`details` names the scope, limit
+    and usage). Administrators may send `{"override_limits": true}`; the
+    override is audited.
 
     **Streams.** `GET /events` and `GET /servers/{id}/console/stream` are
     Server-Sent Events authenticated with the `Authorization` header (read
@@ -60,6 +72,7 @@ tags:
   - name: console
   - name: backups
   - name: realtime
+  - name: actions
   - name: admin
 paths:
   /health:
@@ -153,6 +166,47 @@ paths:
       responses:
         "200": { description: Address updated }
         "404": { $ref: "#/components/responses/Error" }
+  /auth/password/forgot:
+    post:
+      tags: [auth]
+      summary: Request an email password reset link
+      description: |
+        Always answers 202 with the same neutral message, whether or not an
+        eligible account exists. Only regular (non-administrator), enabled
+        accounts with a verified address receive a link; administrators
+        reset forgotten passwords with the command line tool. Rate limited
+        per client address and per email address.
+      security: []
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [email], properties: { email: { type: string, format: email } } } } }
+      responses:
+        "202": { description: Neutral acknowledgement }
+        "400": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
+  /auth/password/reset/check:
+    post:
+      tags: [auth]
+      summary: Check a password reset link before showing the form
+      security: []
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [token], properties: { token: { type: string } } } } }
+      responses:
+        "200": { description: The link is valid }
+        "404": { $ref: "#/components/responses/Error" }
+  /auth/password/reset:
+    post:
+      tags: [auth]
+      summary: Set a new password with a reset link (single use; revokes all sessions)
+      security: []
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [token, password], properties: { token: { type: string }, password: { type: string } } } } }
+      responses:
+        "200": { description: Password changed }
+        "400": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
   /me:
     get:
       tags: [profile]
@@ -191,6 +245,28 @@ paths:
       responses:
         "202": { description: Verification sent }
         "409": { $ref: "#/components/responses/Error" }
+  /me/email/verification:
+    post:
+      tags: [profile]
+      summary: Email a verification link for the current, unverified address
+      responses:
+        "202": { description: Verification sent }
+        "409": { $ref: "#/components/responses/Error" }
+  /me/notifications:
+    get:
+      tags: [profile]
+      summary: Own email notification preferences
+      responses:
+        "200": { description: OK }
+    put:
+      tags: [profile]
+      summary: Change email notification preferences
+      description: Notifications are opt-in and only sent to verified addresses, about servers the user can access and has not muted.
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/NotificationPrefs" } } }
+      responses:
+        "200": { description: Saved }
   /me/sessions:
     get:
       tags: [profile]
@@ -233,6 +309,12 @@ paths:
       responses:
         "200": { description: OK, content: { application/json: { schema: { type: object, properties: { latest: { $ref: "#/components/schemas/Metrics" }, history: { type: array, items: { $ref: "#/components/schemas/Metrics" } }, interval_ms: { type: integer } } } } } }
         "403": { $ref: "#/components/responses/Error" }
+  /capacity:
+    get:
+      tags: [servers]
+      summary: Concurrency limit usage (global and per category)
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Capacity" } } } }
   /servers:
     get:
       tags: [servers]
@@ -268,18 +350,20 @@ paths:
     parameters: [{ $ref: "#/components/parameters/ServerID" }]
     get:
       tags: [servers]
-      summary: Full definition (CONFIG). Environment values are masked for non-administrators.
+      summary: Full definition (CONFIG). Environment values are masked and custom actions omitted for non-administrators.
       responses:
         "200": { description: OK }
     put:
       tags: [servers]
       summary: Replace the definition (CONFIG)
       description: |
-        Non-administrators may only change the name, description, category,
-        timeouts, cooldown, polling intervals and the console readiness
-        pattern. Changes to anything that affects execution are refused with
-        403. Execution changes are refused with 409 while the server is
-        running.
+        Non-administrators may only change the name, description, timeouts,
+        cooldown, polling intervals and the console readiness pattern.
+        Changes to anything that affects execution, and to the category
+        (which decides the concurrency limit), are refused with 403; custom
+        actions sent by non-administrators are ignored. Changes to what
+        controls the running process are refused with 409 while the server
+        is running; backups and custom actions can be changed at any time.
       requestBody:
         required: true
         content: { application/json: { schema: { $ref: "#/components/schemas/Definition" } } }
@@ -306,7 +390,10 @@ paths:
     parameters: [{ $ref: "#/components/parameters/ServerID" }]
     post:
       tags: [servers]
-      summary: Start (START)
+      summary: Start (START). Checks and reserves a concurrency slot atomically.
+      requestBody:
+        required: false
+        content: { application/json: { schema: { $ref: "#/components/schemas/StartOptions" } } }
       responses:
         "202": { $ref: "#/components/responses/Accepted" }
         "409": { $ref: "#/components/responses/Error" }
@@ -325,6 +412,9 @@ paths:
     post:
       tags: [servers]
       summary: Restart (STOP), where the backend and configuration allow it
+      requestBody:
+        required: false
+        content: { application/json: { schema: { $ref: "#/components/schemas/StartOptions" } } }
       responses:
         "202": { $ref: "#/components/responses/Accepted" }
         "409": { $ref: "#/components/responses/Error" }
@@ -376,12 +466,18 @@ paths:
     parameters: [{ $ref: "#/components/parameters/ServerID" }]
     get:
       tags: [backups]
-      summary: List backup files (BACKUPS)
+      summary: Backup state (BACKUP_CREATE or BACKUP_DOWNLOAD); files are listed only with BACKUP_DOWNLOAD
       responses:
         "200": { description: OK }
     post:
       tags: [backups]
-      summary: Run the configured backup command (BACKUPS)
+      summary: Start a backup (BACKUP_CREATE)
+      description: |
+        Runs the configured backup command, or - with the tmux method - types
+        the configured command into the server's tmux session. A tmux backup
+        without a completion pattern ends as `submitted`: the command was
+        delivered, completion cannot be verified, and the file list refreshes
+        (event `server.backups.changed`) when new files appear.
       responses:
         "202": { $ref: "#/components/responses/Accepted" }
         "409": { $ref: "#/components/responses/Error" }
@@ -389,7 +485,7 @@ paths:
     parameters: [{ $ref: "#/components/parameters/ServerID" }]
     post:
       tags: [backups]
-      summary: Cancel a running backup (BACKUPS)
+      summary: Cancel a running backup (BACKUP_CREATE)
       responses:
         "204": { description: Cancelled }
   /servers/{id}/backups/{name}:
@@ -398,7 +494,7 @@ paths:
       - { name: name, in: path, required: true, schema: { type: string } }
     delete:
       tags: [backups]
-      summary: Delete a backup file (administrators, or BACKUPS holders if enabled for the server)
+      summary: Delete a backup file (administrators, or BACKUP_DOWNLOAD holders if enabled for the server)
       responses:
         "204": { description: Deleted }
   /servers/{id}/backups/{name}/download:
@@ -407,7 +503,7 @@ paths:
       - { name: name, in: path, required: true, schema: { type: string } }
     post:
       tags: [backups]
-      summary: Create a single-use download link (BACKUPS)
+      summary: Create a single-use download link (BACKUP_DOWNLOAD)
       description: Returns a URL valid for 60 seconds and one request. It is bound to this file and carries no other authority.
       responses:
         "200": { description: OK, content: { application/json: { schema: { type: object, properties: { url: { type: string }, expires_in: { type: integer }, size: { type: integer }, name: { type: string } } } } } }
@@ -424,9 +520,66 @@ paths:
     parameters: [{ $ref: "#/components/parameters/ServerID" }]
     get:
       tags: [admin]
-      summary: Every user's mask for this server (administrators)
+      summary: Every user's mask and action grants for this server (administrators)
       responses:
         "200": { description: OK }
+  /servers/{id}/actions:
+    parameters: [{ $ref: "#/components/parameters/ServerID" }]
+    get:
+      tags: [actions]
+      summary: Custom actions the caller may run, with their current and last run
+      description: Never includes what an action executes.
+      responses:
+        "200": { description: OK }
+    post:
+      tags: [actions]
+      summary: Add a custom action (administrators)
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/Action" } } }
+      responses:
+        "201": { description: Created }
+        "409": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
+  /servers/{id}/actions/{aid}:
+    parameters:
+      - { $ref: "#/components/parameters/ServerID" }
+      - { $ref: "#/components/parameters/ActionID" }
+    put:
+      tags: [actions]
+      summary: Replace a custom action (administrators; the ID is immutable)
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/Action" } } }
+      responses:
+        "200": { description: Saved }
+        "404": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
+    delete:
+      tags: [actions]
+      summary: Delete a custom action and its grants (administrators)
+      responses:
+        "204": { description: Deleted }
+  /servers/{id}/actions/{aid}/run:
+    parameters:
+      - { $ref: "#/components/parameters/ServerID" }
+      - { $ref: "#/components/parameters/ActionID" }
+    post:
+      tags: [actions]
+      summary: Run a custom action (administrators, or users granted this action)
+      description: |
+        Runs exactly what the administrator configured; the request can only
+        confirm it. Actions that require confirmation need `{"confirm":
+        true}`. One run per action at a time; rate limited per user and
+        server. The result arrives as a `server.action.completed` event.
+      requestBody:
+        required: false
+        content: { application/json: { schema: { type: object, properties: { confirm: { type: boolean } } } } }
+      responses:
+        "202": { description: Accepted }
+        "403": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
   /admin/users:
     get:
       tags: [admin]
@@ -466,9 +619,23 @@ paths:
       summary: Set a user's permission bitmask for a server (0 removes access)
       requestBody:
         required: true
-        content: { application/json: { schema: { type: object, required: [mask], properties: { mask: { type: integer, minimum: 0, maximum: 63 } } } } }
+        content: { application/json: { schema: { type: object, required: [mask], properties: { mask: { type: integer, minimum: 0, maximum: 255, description: "Bits: START=1, STOP=2, CONSOLE_READ=4, CONSOLE_WRITE=8, CONFIG=32, BACKUP_CREATE=64, BACKUP_DOWNLOAD=128 (16 = legacy BACKUPS, stored as 64|128)" } } } } }
       responses:
         "200": { description: Saved }
+  /admin/users/{uid}/actions/{id}/{aid}:
+    parameters:
+      - { $ref: "#/components/parameters/UserID" }
+      - { $ref: "#/components/parameters/ServerID" }
+      - { $ref: "#/components/parameters/ActionID" }
+    put:
+      tags: [admin]
+      summary: Grant or revoke one custom action for one user
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [allowed], properties: { allowed: { type: boolean } } } } }
+      responses:
+        "200": { description: Saved }
+        "404": { $ref: "#/components/responses/Error" }
   /admin/users/{uid}/sessions:
     parameters: [{ $ref: "#/components/parameters/UserID" }]
     delete:
@@ -563,6 +730,40 @@ paths:
       summary: Re-read the server definition files from disk
       responses:
         "200": { description: OK }
+  /admin/categories:
+    get:
+      tags: [admin]
+      summary: Managed categories with usage, and unmanaged category values in use
+      responses:
+        "200": { description: OK }
+    post:
+      tags: [admin]
+      summary: Create a category
+      description: Servers whose category value equals the new category's name are reassigned to its ID.
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/Category" } } }
+      responses:
+        "201": { description: Created }
+        "409": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
+  /admin/categories/{cid}:
+    parameters: [{ name: cid, in: path, required: true, schema: { type: string } }]
+    put:
+      tags: [admin]
+      summary: Change a category's name, description or limit (the ID is immutable)
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/Category" } } }
+      responses:
+        "200": { description: Saved }
+        "404": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
+    delete:
+      tags: [admin]
+      summary: Delete a category; its servers keep the name as an unmanaged category
+      responses:
+        "204": { description: Deleted }
 components:
   securitySchemes:
     bearer: { type: http, scheme: bearer, bearerFormat: JWT }
@@ -570,6 +771,7 @@ components:
   parameters:
     ServerID: { name: id, in: path, required: true, schema: { type: string, pattern: "^[a-z0-9][a-z0-9_-]{0,62}$" } }
     UserID: { name: uid, in: path, required: true, schema: { type: integer } }
+    ActionID: { name: aid, in: path, required: true, schema: { type: string, pattern: "^[a-z0-9][a-z0-9_-]{0,62}$" } }
     XRequestedWith: { name: X-Requested-With, in: header, required: true, schema: { type: string, enum: [server-manager] } }
     LastEventID: { name: Last-Event-ID, in: header, required: false, schema: { type: string } }
   responses:
@@ -625,7 +827,7 @@ components:
       type: object
       properties:
         id: { type: integer }
-        type: { type: string, enum: [start, stop, restart, backup] }
+        type: { type: string, enum: [start, stop, restart, backup, action] }
         user: { type: string }
         started_at: { type: string, format: date-time }
     Server:
@@ -634,7 +836,9 @@ components:
         id: { type: string }
         name: { type: string }
         description: { type: string }
-        category: { type: string }
+        category: { type: string, description: The definition's raw category value }
+        category_id: { type: string, description: The managed category it refers to, if any }
+        category_name: { type: string }
         backend: { type: string, enum: [custom, tmux, systemd, docker] }
         status: { $ref: "#/components/schemas/Status" }
         capabilities:
@@ -646,7 +850,14 @@ components:
             console_input: { type: boolean }
             backups: { type: boolean }
             backup_create: { type: boolean }
+            backup_method: { type: string, enum: [command, tmux] }
         permissions: { type: integer, description: The caller's effective mask }
+        actions:
+          type: array
+          description: Custom actions the caller may run (name and presentation only)
+          items:
+            type: object
+            properties: { id: { type: string }, name: { type: string }, description: { type: string }, icon: { type: string }, method: { type: string }, confirm: { type: boolean }, disabled: { type: boolean } }
     Metrics:
       type: object
       properties:
@@ -740,9 +951,13 @@ components:
         backup:
           type: object
           properties:
-            directory: { type: string }
+            directory: { type: string, description: Required for the command method }
+            method: { type: string, enum: [command, tmux], default: command }
             command: { $ref: "#/components/schemas/Command" }
+            tmux: { $ref: "#/components/schemas/TmuxText" }
+            completion: { type: object, description: Console line that confirms a tmux backup finished, properties: { pattern: { type: string }, regex: { type: boolean } } }
             allow_user_delete: { type: boolean }
+        actions: { type: array, items: { $ref: "#/components/schemas/Action" } }
         timeouts:
           type: object
           properties:
@@ -752,3 +967,52 @@ components:
             command: { type: string, example: 15s }
         cooldown: { type: string }
         status_poll_interval: { type: string }
+    TmuxText:
+      type: object
+      required: [text]
+      properties:
+        text: { type: string, description: Typed literally into the server's tmux pane (one line, no control characters) }
+        enter: { type: boolean, default: true, description: Press Enter after the text }
+    Action:
+      type: object
+      required: [id, name, method]
+      properties:
+        id: { type: string, pattern: "^[a-z0-9][a-z0-9_-]{0,62}$" }
+        name: { type: string }
+        description: { type: string }
+        icon: { type: string }
+        method: { type: string, enum: [command, tmux] }
+        command: { $ref: "#/components/schemas/Command" }
+        working_dir: { type: string }
+        tmux: { $ref: "#/components/schemas/TmuxText" }
+        timeout: { type: string, example: 10m, description: Command actions only }
+        confirm: { type: boolean }
+        disabled: { type: boolean }
+    Category:
+      type: object
+      required: [id, name]
+      properties:
+        id: { type: string, pattern: "^[a-z0-9][a-z0-9_-]{0,62}$" }
+        name: { type: string }
+        description: { type: string }
+        max_concurrent: { type: integer, minimum: 0, description: 0 = unlimited }
+    Capacity:
+      type: object
+      properties:
+        global: { type: object, properties: { in_use: { type: integer }, limit: { type: integer } } }
+        categories:
+          type: array
+          items: { type: object, properties: { id: { type: string }, name: { type: string }, servers: { type: integer }, in_use: { type: integer }, limit: { type: integer } } }
+    StartOptions:
+      type: object
+      properties:
+        override_limits: { type: boolean, description: Administrators only; start despite a reached concurrency limit (audited) }
+    NotificationPrefs:
+      type: object
+      properties:
+        enabled: { type: boolean }
+        on_ready: { type: boolean }
+        on_stopped: { type: boolean }
+        on_crash: { type: boolean }
+        on_failure: { type: boolean }
+        muted: { type: array, items: { type: string }, description: Server IDs to receive no notifications about }

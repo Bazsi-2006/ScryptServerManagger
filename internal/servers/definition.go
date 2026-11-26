@@ -45,6 +45,15 @@ const (
 	// EnvMask replaces environment values when a definition is shown to
 	// someone who may not read them; on update it means "keep current value".
 	EnvMask = "********"
+
+	// Backup and custom action execution methods.
+	MethodCommand = "command" // run an executable with an argument list
+	MethodTmux    = "tmux"    // type predefined text into the server's tmux pane
+
+	// MaxActions bounds the custom actions of one server.
+	MaxActions = 64
+	// DefaultActionTimeout applies to command actions without a timeout.
+	DefaultActionTimeout = 10 * time.Minute
 )
 
 // Command is an executable plus its argument vector. It is always executed
@@ -158,12 +167,89 @@ type Console struct {
 	InputCommand *Command `json:"input_command,omitempty"`
 }
 
+// TmuxText is predefined text typed literally into the server's tmux pane
+// (send-keys -l), optionally followed by the Enter key. It is data for the
+// server's console and never interpreted by a shell on the host.
+type TmuxText struct {
+	Text string `json:"text"`
+	// Enter presses Enter after the text. Default true.
+	Enter *bool `json:"enter,omitempty"`
+}
+
+// PressEnter reports whether Enter follows the text.
+func (t *TmuxText) PressEnter() bool { return boolOr(t.Enter, true) }
+
 type Backup struct {
-	Directory string   `json:"directory"`
-	Command   *Command `json:"command,omitempty"`
-	// AllowUserDelete lets holders of the BACKUPS permission delete backup
-	// files; otherwise only administrators can.
+	// Directory holds the backup files that can be listed and downloaded.
+	// Required for the command method (it is passed as SM_BACKUP_DIR);
+	// optional for the tmux method.
+	Directory string `json:"directory"`
+	// Method is "command" (default: run Command) or "tmux" (type Tmux.Text
+	// into the server's tmux pane; tmux backend only).
+	Method  string    `json:"method,omitempty"`
+	Command *Command  `json:"command,omitempty"`
+	Tmux    *TmuxText `json:"tmux,omitempty"`
+	// Completion recognises the end of a tmux backup in the console output.
+	// Without it, a tmux backup is reported as "submitted": the command was
+	// delivered, but whether the backup finished cannot be verified.
+	Completion *ConsoleMatch `json:"completion,omitempty"`
+	// AllowUserDelete lets holders of the BACKUP_DOWNLOAD permission delete
+	// backup files; otherwise only administrators can.
 	AllowUserDelete bool `json:"allow_user_delete,omitempty"`
+}
+
+// CanCreate reports whether backups can be started for this configuration.
+func (b *Backup) CanCreate() bool {
+	if b == nil {
+		return false
+	}
+	if b.Method == MethodTmux {
+		return b.Tmux != nil
+	}
+	return b.Command != nil
+}
+
+// Action is an administrator-defined command module attached to a server.
+// Users run it by ID; they can never change what it executes.
+type Action struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	// Icon is an optional short symbol (for example an emoji) shown on the
+	// action's button.
+	Icon string `json:"icon,omitempty"`
+	// Method is "command" (run Command) or "tmux" (type Tmux.Text into the
+	// server's tmux pane; tmux backend only).
+	Method  string    `json:"method"`
+	Command *Command  `json:"command,omitempty"`
+	Tmux    *TmuxText `json:"tmux,omitempty"`
+	// WorkingDir overrides the server's working directory for commands.
+	WorkingDir string `json:"working_dir,omitempty"`
+	// Timeout bounds a command action (default 10m); it is killed after.
+	Timeout Duration `json:"timeout,omitempty"`
+	// Confirm asks for confirmation before the action runs.
+	Confirm bool `json:"confirm,omitempty"`
+	// Disabled hides the action from users and refuses to run it.
+	Disabled bool `json:"disabled,omitempty"`
+}
+
+// Action returns the custom action with the given ID, or nil.
+func (d *Definition) Action(id string) *Action {
+	for i := range d.Actions {
+		if d.Actions[i].ID == id {
+			return &d.Actions[i]
+		}
+	}
+	return nil
+}
+
+// ActionIDs lists the IDs of the custom actions.
+func (d *Definition) ActionIDs() []string {
+	out := make([]string, 0, len(d.Actions))
+	for _, a := range d.Actions {
+		out = append(out, a.ID)
+	}
+	return out
 }
 
 type Timeouts struct {
@@ -191,7 +277,9 @@ type Definition struct {
 	Readiness Readiness `json:"readiness"`
 	Console   Console   `json:"console"`
 	Backup    *Backup   `json:"backup,omitempty"`
-	Timeouts  Timeouts  `json:"timeouts"`
+	// Actions are custom command modules users can be allowed to run.
+	Actions  []Action `json:"actions,omitempty"`
+	Timeouts Timeouts `json:"timeouts"`
 	// Cooldown overrides rate_limits.server_cooldown for this server.
 	Cooldown *Duration `json:"cooldown,omitempty"`
 	// StatusPollInterval overrides monitoring.status_poll_interval.
@@ -346,6 +434,76 @@ func (v *validator) args(field string, args []string) {
 	}
 }
 
+// tmuxText validates predefined text for a tmux pane: one line without
+// control characters (send-keys -l types it literally; a control character
+// could otherwise act as a key press).
+func (v *validator) tmuxText(field string, t *TmuxText) {
+	switch {
+	case strings.TrimSpace(t.Text) == "":
+		v.add(field, "is required")
+	case len(t.Text) > 1024:
+		v.add(field, "must be at most 1024 bytes")
+	case hasControl(t.Text):
+		v.add(field, "must be a single line without control characters")
+	}
+}
+
+func (v *validator) consoleMatch(field string, cm *ConsoleMatch) {
+	if cm.Pattern == "" {
+		v.add(field, "is required")
+		return
+	}
+	if len(cm.Pattern) > 1000 {
+		v.add(field, "is too long")
+	}
+	if cm.Regex {
+		if _, err := regexp.Compile(cm.Pattern); err != nil {
+			v.add(field, "is not a valid regular expression: %v", err)
+		}
+	}
+}
+
+func (d *Definition) validateActions(v *validator) {
+	if len(d.Actions) > MaxActions {
+		v.add("actions", "must have at most %d entries", MaxActions)
+	}
+	seen := map[string]bool{}
+	for i := range d.Actions {
+		a := &d.Actions[i]
+		f := fmt.Sprintf("actions[%d]", i)
+		if !idRe.MatchString(a.ID) {
+			v.add(f+".id", "must be 1-63 characters of a-z, 0-9, '_' or '-' and start with a letter or digit")
+		} else if seen[a.ID] {
+			v.add(f+".id", "%q is used by more than one action", a.ID)
+		}
+		seen[a.ID] = true
+		v.text(f+".name", a.Name, 100, true)
+		v.text(f+".description", a.Description, 500, false)
+		v.text(f+".icon", a.Icon, 16, false)
+		switch a.Method {
+		case MethodCommand:
+			if a.Command == nil {
+				v.add(f+".command.command", "is required")
+			} else {
+				v.command(f+".command", a.Command)
+			}
+			v.absPath(f+".working_dir", a.WorkingDir, false)
+			v.duration(f+".timeout", a.Timeout, time.Second, 24*time.Hour)
+		case MethodTmux:
+			if d.Backend != BackendTmux {
+				v.add(f+".method", "tmux is only available for servers that use the tmux backend")
+			}
+			if a.Tmux == nil {
+				v.add(f+".tmux.text", "is required")
+			} else {
+				v.tmuxText(f+".tmux.text", a.Tmux)
+			}
+		default:
+			v.add(f+".method", "must be command or tmux")
+		}
+	}
+}
+
 func (v *validator) duration(field string, d Duration, min, max time.Duration) {
 	if d.D() < min || d.D() > max {
 		v.add(field, "must be between %s and %s", min, max)
@@ -454,12 +612,52 @@ func (d *Definition) Normalize() {
 	}
 	if b := d.Backup; b != nil {
 		clean(&b.Directory)
+		if b.Method == "" {
+			b.Method = MethodCommand
+		}
 		if b.Command != nil && b.Command.Command == "" {
 			b.Command = nil
 		}
-		if b.Directory == "" && b.Command == nil {
+		if b.Tmux != nil && b.Tmux.Text == "" {
+			b.Tmux = nil
+		}
+		if b.Completion != nil && b.Completion.Pattern == "" {
+			b.Completion = nil
+		}
+		// Only discard what a known method ignores: a misspelt method must
+		// fail validation rather than silently drop the configuration.
+		switch b.Method {
+		case MethodTmux:
+			b.Command = nil
+		case MethodCommand:
+			b.Tmux, b.Completion = nil, nil
+		}
+		if b.Directory == "" && b.Command == nil && b.Tmux == nil {
 			d.Backup = nil
 		}
+	}
+	for i := range d.Actions {
+		a := &d.Actions[i]
+		a.ID = strings.TrimSpace(a.ID)
+		a.Name = strings.TrimSpace(a.Name)
+		a.Description = strings.TrimSpace(a.Description)
+		a.Icon = strings.TrimSpace(a.Icon)
+		if a.Method == "" {
+			a.Method = MethodCommand
+		}
+		clean(&a.WorkingDir)
+		switch a.Method {
+		case MethodTmux:
+			a.Command, a.WorkingDir, a.Timeout = nil, "", 0
+		case MethodCommand:
+			a.Tmux = nil
+			if a.Timeout == 0 {
+				a.Timeout = Duration(DefaultActionTimeout)
+			}
+		}
+	}
+	if len(d.Actions) == 0 {
+		d.Actions = nil
 	}
 	t := &d.Timeouts
 	if t.Start == 0 {
@@ -518,14 +716,32 @@ func (d *Definition) Validate() error {
 	d.validateConsole(v)
 
 	if b := d.Backup; b != nil {
-		v.absPath("backup.directory", b.Directory, true)
+		v.absPath("backup.directory", b.Directory, b.Method != MethodTmux)
 		if b.Directory == "/" {
 			v.add("backup.directory", "must not be the filesystem root")
 		}
-		if b.Command != nil {
-			v.command("backup.command", b.Command)
+		switch b.Method {
+		case MethodCommand:
+			if b.Command != nil {
+				v.command("backup.command", b.Command)
+			}
+		case MethodTmux:
+			if d.Backend != BackendTmux {
+				v.add("backup.method", "tmux is only available for servers that use the tmux backend")
+			}
+			if b.Tmux == nil {
+				v.add("backup.tmux.text", "is required for the tmux backup method")
+			} else {
+				v.tmuxText("backup.tmux.text", b.Tmux)
+			}
+			if b.Completion != nil {
+				v.consoleMatch("backup.completion.pattern", b.Completion)
+			}
+		default:
+			v.add("backup.method", "must be command or tmux")
 		}
 	}
+	d.validateActions(v)
 	v.duration("timeouts.start", d.Timeouts.Start, time.Second, 24*time.Hour)
 	v.duration("timeouts.stop", d.Timeouts.Stop, time.Second, 24*time.Hour)
 	v.duration("timeouts.backup", d.Timeouts.Backup, time.Second, 7*24*time.Hour)
@@ -664,18 +880,11 @@ func (d *Definition) validateReadiness(v *validator) {
 	switch r.Method {
 	case ReadyNone:
 	case ReadyConsole:
-		if r.Console == nil || r.Console.Pattern == "" {
+		if r.Console == nil {
 			v.add("readiness.console.pattern", "is required")
 			break
 		}
-		if len(r.Console.Pattern) > 1000 {
-			v.add("readiness.console.pattern", "is too long")
-		}
-		if r.Console.Regex {
-			if _, err := regexp.Compile(r.Console.Pattern); err != nil {
-				v.add("readiness.console.pattern", "is not a valid regular expression: %v", err)
-			}
-		}
+		v.consoleMatch("readiness.console.pattern", r.Console)
 	case ReadyPort:
 		p := r.Port
 		if p == nil {
@@ -755,9 +964,12 @@ func (d *Definition) validateConsole(v *validator) {
 }
 
 // ExecutionEqual reports whether two definitions are identical in every
-// field that influences what gets executed on the host. Fields outside this
-// set (name, description, category, timeouts, console readiness pattern,
-// polling intervals, cooldown) are the "safe" ones a CONFIG holder may edit.
+// field that influences what gets executed on the host (custom actions
+// included). Fields outside this set (name, description, category,
+// timeouts, console readiness pattern, polling intervals, cooldown) are the
+// "safe" ones a CONFIG holder may edit - except category, which decides the
+// concurrency limit a server falls under and is therefore reserved for
+// administrators separately (see the API layer).
 func ExecutionEqual(a, b *Definition) bool {
 	strip := func(d *Definition) *Definition {
 		c := d.Clone()
@@ -774,6 +986,26 @@ func ExecutionEqual(a, b *Definition) bool {
 	x, _ := json.Marshal(strip(a))
 	y, _ := json.Marshal(strip(b))
 	return string(x) == string(y)
+}
+
+// RuntimeEqual reports whether two definitions control the server process
+// identically. It ignores the backup configuration and the custom actions,
+// which are executed on demand and never touch the running backend, so they
+// can be changed while the server is running.
+func RuntimeEqual(a, b *Definition) bool {
+	x, y := a.Clone(), b.Clone()
+	x.Backup, y.Backup = nil, nil
+	x.Actions, y.Actions = nil, nil
+	return ExecutionEqual(x, y)
+}
+
+// WithoutActions returns a copy without custom actions. Custom actions are
+// managed by administrators only; other readers of a configuration do not
+// see their commands.
+func (d *Definition) WithoutActions() *Definition {
+	c := d.Clone()
+	c.Actions = nil
+	return c
 }
 
 // MaskEnv returns a copy with every environment value hidden.

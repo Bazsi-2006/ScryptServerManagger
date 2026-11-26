@@ -5,6 +5,7 @@ package manager
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -68,6 +69,8 @@ type Capabilities struct {
 	ConsoleInput bool `json:"console_input"`
 	Backups      bool `json:"backups"`
 	BackupCreate bool `json:"backup_create"`
+	// BackupMethod is "command" or "tmux" when backups can be created.
+	BackupMethod string `json:"backup_method,omitempty"`
 }
 
 // Errors returned by manager operations. The API layer maps them to
@@ -115,9 +118,17 @@ type Manager struct {
 	mu      sync.RWMutex
 	servers map[string]*server
 
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	// capMu serialises concurrency-limit checks with their reservations.
+	capMu sync.Mutex
+	// editMu serialises read-modify-write edits of definitions (actions).
+	editMu sync.Mutex
+	// onTransition receives lifecycle transitions (notifications).
+	onTransition func(Transition)
+
+	ctx       context.Context
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
+	actionsWG sync.WaitGroup
 }
 
 func New(cfg *config.Holder, defs *servers.Store, store *db.Store, pub Publisher, rec *audit.Recorder, log *slog.Logger) *Manager {
@@ -134,6 +145,7 @@ func (m *Manager) Load() {
 		m.log.Error("could not mark interrupted operations", "error", err)
 	}
 	for _, def := range m.defs.List() {
+		m.pruneActionGrants(def)
 		m.add(def)
 	}
 }
@@ -176,13 +188,19 @@ func (m *Manager) Capabilities(id string) (Capabilities, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	caps := s.be.Caps()
+	_, sendsText := s.be.(backend.TextSender)
+	b := s.def.Backup
 	c := Capabilities{
 		Start:        caps.Start,
 		Stop:         true,
 		Restart:      caps.Start && s.restartAllowedLocked(),
 		ConsoleInput: s.def.InputMethod() != servers.InputNone,
-		Backups:      s.def.Backup != nil && s.def.Backup.Directory != "",
-		BackupCreate: s.def.Backup != nil && s.def.Backup.Command != nil,
+		Backups:      b != nil && b.Directory != "",
+		BackupCreate: b.CanCreate() && (b.Method != servers.MethodTmux || sendsText),
+		BackupMethod: "",
+	}
+	if c.BackupCreate {
+		c.BackupMethod = b.Method
 	}
 	return c, nil
 }
@@ -227,7 +245,7 @@ func (m *Manager) Update(def *servers.Definition) (*servers.Definition, error) {
 	}
 	s.mu.Lock()
 	active := s.op != nil || s.state == Starting || s.state == Running || s.state == Stopping
-	if active && !servers.ExecutionEqual(s.def, next) {
+	if active && !servers.RuntimeEqual(s.def, next) {
 		s.mu.Unlock()
 		return nil, ErrActive
 	}
@@ -236,13 +254,15 @@ func (m *Manager) Update(def *servers.Definition) (*servers.Definition, error) {
 		s.mu.Unlock()
 		return nil, err
 	}
-	if active {
-		// Only presentation/timeout fields changed; keep the live backend.
+	if active || onlyOnDemandChanged(s.def, saved) {
+		// Nothing that controls the process changed (presentation,
+		// timeouts, backups, custom actions); keep the live backend.
 		s.def = saved
 	} else {
 		s.rebuildLocked(saved)
 	}
 	s.mu.Unlock()
+	m.pruneActionGrants(saved)
 	s.poke()
 	m.publish(events.Event{Type: "server.updated", Audience: events.AudienceServer, ServerID: saved.ID, Data: map[string]any{"server_id": saved.ID}})
 	return saved, nil
@@ -289,6 +309,7 @@ func (m *Manager) Delete(id string, force bool) error {
 	_ = m.store.DeleteRuntime(ctx, id)
 	backend.RemoveRuntimeFiles(m.cfg.Get().Paths.RuntimeDir, id)
 	m.cooldown.Forget(id)
+	m.NotifyCapacityChanged()
 	return nil
 }
 
@@ -327,18 +348,19 @@ func (m *Manager) Reload() (*ReloadResult, error) {
 			continue
 		}
 		s.mu.Lock()
-		same := servers.ExecutionEqual(prev, d)
+		same := servers.RuntimeEqual(prev, d)
 		active := s.op != nil || s.state == Starting || s.state == Running || s.state == Stopping
 		switch {
 		case active && !same:
 			res.Skipped[d.ID] = "server is active; execution changes take effect after it is stopped and the definitions are reloaded again"
 			s.def = mergeSafe(s.def, d)
-		case active:
+		case active || onlyOnDemandChanged(s.def, d):
 			s.def = d
 		default:
 			s.rebuildLocked(d)
 		}
 		s.mu.Unlock()
+		m.pruneActionGrants(d)
 		res.Updated = append(res.Updated, d.ID)
 		m.publish(events.Event{Type: "server.updated", Audience: events.AudienceServer, ServerID: d.ID, Data: map[string]any{"server_id": d.ID}})
 	}
@@ -359,15 +381,34 @@ func (m *Manager) Reload() (*ReloadResult, error) {
 		}
 		res.Removed = append(res.Removed, id)
 	}
+	m.NotifyCapacityChanged()
 	return res, nil
 }
 
-// mergeSafe applies only the non-execution fields of next onto cur.
+// mergeSafe applies the fields of next that do not control the running
+// process onto cur: presentation, timeouts, backups and custom actions.
 func mergeSafe(cur, next *servers.Definition) *servers.Definition {
 	out := cur.Clone()
 	out.Name, out.Description, out.Category = next.Name, next.Description, next.Category
 	out.Timeouts, out.Cooldown, out.StatusPollInterval = next.Timeouts, next.Cooldown, next.StatusPollInterval
+	n := next.Clone()
+	out.Backup, out.Actions = n.Backup, n.Actions
 	return out
+}
+
+// onlyOnDemandChanged reports whether a and b differ at most in fields no
+// backend reads: the backup configuration and custom actions (executed on
+// demand by the manager), the category and the description. Such changes
+// keep the live backend and its console buffer.
+func onlyOnDemandChanged(a, b *servers.Definition) bool {
+	x, y := a.Clone(), b.Clone()
+	x.Backup, y.Backup = nil, nil
+	x.Actions, y.Actions = nil, nil
+	x.Category, y.Category = "", ""
+	x.Description, y.Description = "", ""
+	xj, _ := json.Marshal(x)
+	yj, _ := json.Marshal(y)
+	return string(xj) == string(yj)
 }
 
 // Shutdown stops monitoring, stops the servers that cannot outlive the
@@ -395,7 +436,7 @@ func (m *Manager) Shutdown(ctx context.Context) {
 		s.shutdown()
 	}
 	done := make(chan struct{})
-	go func() { m.wg.Wait(); close(done) }()
+	go func() { m.wg.Wait(); m.actionsWG.Wait(); close(done) }()
 	select {
 	case <-done:
 	case <-time.After(10 * time.Second):
@@ -410,9 +451,9 @@ func (m *Manager) newBuffer() *console.Buffer {
 // InvalidFiles lists definition files that failed to load, with reasons.
 func (m *Manager) InvalidFiles() map[string]string { return m.defs.Invalid() }
 
-// NotifyBackupsChanged tells clients holding BACKUPS that the file list of
+// NotifyBackupsChanged tells clients holding BACKUP_DOWNLOAD that the file list of
 // a server changed.
 func (m *Manager) NotifyBackupsChanged(id string) {
-	m.publish(events.Event{Type: "server.backups.changed", Audience: events.AudienceServer, ServerID: id, Perm: perm.Backups,
+	m.publish(events.Event{Type: "server.backups.changed", Audience: events.AudienceServer, ServerID: id, Perm: perm.BackupDownload,
 		Data: map[string]any{"server_id": id}})
 }

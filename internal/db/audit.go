@@ -142,15 +142,44 @@ func (s *Store) PurgeAudit(ctx context.Context, before time.Time) (int64, error)
 // ---- operation history ----
 
 type Operation struct {
-	ID         int64      `json:"id"`
-	ServerID   string     `json:"server_id"`
-	Type       string     `json:"type"`
+	ID       int64  `json:"id"`
+	ServerID string `json:"server_id"`
+	Type     string `json:"type"`
+	// ActionID names the custom action of an "action" operation.
+	ActionID   string     `json:"action_id,omitempty"`
 	UserID     *int64     `json:"user_id"`
 	Username   string     `json:"username"`
 	Status     string     `json:"status"`
 	Message    string     `json:"message"`
 	StartedAt  time.Time  `json:"started_at"`
 	FinishedAt *time.Time `json:"finished_at"`
+	// Output is the tail of an action's output (only filled where the
+	// caller may see it).
+	Output string `json:"output,omitempty"`
+}
+
+const operationCols = `o.id, o.server_id, o.type, o.action_id, o.user_id, o.username, o.status, o.message, o.started_at, o.finished_at`
+
+func scanOperation(r scanner, extra ...any) (*Operation, error) {
+	var op Operation
+	var uid, fin sql.NullInt64
+	var started int64
+	dest := append([]any{&op.ID, &op.ServerID, &op.Type, &op.ActionID, &uid, &op.Username, &op.Status, &op.Message, &started, &fin}, extra...)
+	if err := r.Scan(dest...); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	if uid.Valid {
+		op.UserID = &uid.Int64
+	}
+	op.StartedAt = time.UnixMilli(started).UTC()
+	if fin.Valid {
+		t := time.UnixMilli(fin.Int64).UTC()
+		op.FinishedAt = &t
+	}
+	return &op, nil
 }
 
 func (s *Store) InsertOperation(ctx context.Context, op *Operation) error {
@@ -158,8 +187,8 @@ func (s *Store) InsertOperation(ctx context.Context, op *Operation) error {
 	if op.UserID != nil {
 		uid = sql.NullInt64{Int64: *op.UserID, Valid: true}
 	}
-	res, err := s.DB.ExecContext(ctx, `INSERT INTO operations(server_id, type, user_id, username, status, message, started_at) VALUES (?,?,?,?,?,?,?)`,
-		op.ServerID, op.Type, uid, op.Username, op.Status, op.Message, op.StartedAt.UnixMilli())
+	res, err := s.DB.ExecContext(ctx, `INSERT INTO operations(server_id, type, action_id, user_id, username, status, message, started_at) VALUES (?,?,?,?,?,?,?,?)`,
+		op.ServerID, op.Type, op.ActionID, uid, op.Username, op.Status, op.Message, op.StartedAt.UnixMilli())
 	if err != nil {
 		return err
 	}
@@ -184,29 +213,19 @@ func (s *Store) ListOperations(ctx context.Context, serverID string, limit int) 
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
-	rows, err := s.DB.QueryContext(ctx, `SELECT id, server_id, type, user_id, username, status, message, started_at, finished_at
-		FROM operations WHERE server_id = ? ORDER BY id DESC LIMIT ?`, serverID, limit)
+	rows, err := s.DB.QueryContext(ctx, `SELECT `+operationCols+`
+		FROM operations o WHERE o.server_id = ? ORDER BY o.id DESC LIMIT ?`, serverID, limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	out := []*Operation{}
 	for rows.Next() {
-		var op Operation
-		var uid, fin sql.NullInt64
-		var started int64
-		if err := rows.Scan(&op.ID, &op.ServerID, &op.Type, &uid, &op.Username, &op.Status, &op.Message, &started, &fin); err != nil {
+		op, err := scanOperation(rows)
+		if err != nil {
 			return nil, err
 		}
-		if uid.Valid {
-			op.UserID = &uid.Int64
-		}
-		op.StartedAt = time.UnixMilli(started).UTC()
-		if fin.Valid {
-			t := time.UnixMilli(fin.Int64).UTC()
-			op.FinishedAt = &t
-		}
-		out = append(out, &op)
+		out = append(out, op)
 	}
 	return out, rows.Err()
 }

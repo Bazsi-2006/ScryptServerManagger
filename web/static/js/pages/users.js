@@ -61,8 +61,10 @@ function permissionsDialog(user) {
       servers.map((s) => {
         const status = h('span', { class: 'muted small' });
         let timer = null;
+        const granted = new Set((res.action_permissions || {})[s.id] || []);
+        const actions = s.actions || [];
         return h('div', { class: 'perm-row' },
-          h('div', { class: 'perm-user' }, h('strong', null, s.name), s.category ? h('span', { class: 'muted' }, ' · ' + s.category) : null, status),
+          h('div', { class: 'perm-user' }, h('strong', null, s.name), s.category_name ? h('span', { class: 'muted' }, ' · ' + s.category_name) : null, status),
           permissionEditor(res.permissions[s.id] || 0, (mask) => {
             clearTimeout(timer);
             status.textContent = 'Saving…';
@@ -75,7 +77,24 @@ function permissionsDialog(user) {
                 notify.error(errorMessage(err));
               }
             }, 350);
-          }));
+          }),
+          actions.length ? h('div', { class: 'perm-actions' }, h('div', { class: 'perm-actions-title' }, 'Custom actions (need at least one permission above)'),
+            h('div', { class: 'perm-grid' }, actions.map((a) => {
+              const input = h('input', { type: 'checkbox', checked: granted.has(a.id) });
+              input.addEventListener('change', async () => {
+                input.disabled = true;
+                try {
+                  await api.put(`/admin/users/${user.id}/actions/${api.enc(s.id)}/${api.enc(a.id)}`, { allowed: input.checked });
+                  status.textContent = 'Saved';
+                } catch (err) {
+                  input.checked = !input.checked;
+                  notify.error(errorMessage(err));
+                } finally {
+                  input.disabled = false;
+                }
+              });
+              return h('label', { class: 'perm' }, input, h('span', null, h('strong', null, (a.icon ? a.icon + ' ' : '') + a.name), h('small', null, a.description || (a.method === 'tmux' ? 'Console command' : 'Script'))));
+            }))) : null);
       }));
   }).catch((err) => replace(body, errorBox(err)));
 }

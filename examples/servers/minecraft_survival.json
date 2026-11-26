@@ -1,8 +1,8 @@
 {
   "id": "minecraft_survival",
   "name": "Minecraft Survival",
-  "description": "Paper server running in a tmux session. Console is streamed live; commands are typed into the pane.",
-  "category": "Minecraft",
+  "description": "Paper server running in a tmux session. Console is streamed live; commands are typed into the pane. Two custom actions: Save World types a console command; Update Server runs a script (with confirmation).",
+  "category": "minecraft",
   "backend": "tmux",
   "working_dir": "/opt/minecraft/survival",
   "env": {
@@ -12,18 +12,60 @@
     "session": "mc-survival",
     "start": {
       "command": "/usr/bin/java",
-      "args": ["-jar", "paper.jar", "--nogui"]
+      "args": [
+        "-jar",
+        "paper.jar",
+        "--nogui"
+      ]
     },
     "stop_text": "stop",
     "kill_on_timeout": true
   },
   "readiness": {
     "method": "console",
-    "console": { "pattern": "Done \\([0-9.]+s\\)! For help, type \"help\"", "regex": true }
+    "console": {
+      "pattern": "Done \\([0-9.]+s\\)! For help, type \"help\"",
+      "regex": true
+    }
   },
   "backup": {
     "directory": "/opt/minecraft/survival/backups",
-    "command": { "command": "/opt/minecraft/survival/backup.sh" }
+    "command": {
+      "command": "/opt/minecraft/survival/backup.sh"
+    }
   },
-  "timeouts": { "start": "3m", "stop": "1m", "backup": "30m" }
+  "actions": [
+    {
+      "id": "save_world",
+      "name": "Save World",
+      "icon": "💾",
+      "description": "Forces the server to save its world.",
+      "method": "tmux",
+      "tmux": {
+        "text": "save-all flush",
+        "enter": true
+      }
+    },
+    {
+      "id": "update_server",
+      "name": "Update Server",
+      "icon": "⬆",
+      "description": "Downloads the latest Paper build. Stop the server first.",
+      "method": "command",
+      "command": {
+        "command": "/opt/minecraft/survival/update.sh",
+        "args": [
+          "--channel",
+          "stable"
+        ]
+      },
+      "timeout": "15m",
+      "confirm": true
+    }
+  ],
+  "timeouts": {
+    "start": "3m",
+    "stop": "1m",
+    "backup": "30m"
+  }
 }

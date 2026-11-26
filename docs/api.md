@@ -68,7 +68,8 @@ A server whose state cannot be determined is reported in its status
 curl -s -X POST -H "Authorization: Bearer $TOKEN" https://servers.example.com/api/v1/servers/minecraft_survival/start
 ```
 
-Start, stop, restart and backup answer `202 Accepted` immediately:
+Start, stop, restart, backup and custom action runs answer `202 Accepted`
+immediately:
 
 ```json
 { "operation": { "id": 42, "type": "start", "user": "alice", "started_at": "…" },
@@ -76,7 +77,37 @@ Start, stop, restart and backup answer `202 Accepted` immediately:
 ```
 
 Then follow `GET /servers/{id}/status` or the event stream until `operation`
-is `null`. `GET /servers/{id}/operations` returns the history with outcomes.
+is `null`. `GET /servers/{id}/operations` returns the history with outcomes:
+`succeeded`, `failed`, `cancelled`, `interrupted`, or `submitted` (a tmux
+backup or action whose text was delivered but whose effect cannot be
+verified).
+
+A start (or a restart of a stopped server) is refused with `409` and code
+`concurrency_limit` when the global or the category limit is reached:
+
+```json
+{ "error": { "code": "concurrency_limit",
+  "message": "Cannot start the server: the Minecraft category has reached its limit of 2 concurrently running servers.",
+  "details": { "scope": "category", "category_id": "minecraft", "category_name": "Minecraft", "limit": 2, "in_use": 2 } } }
+```
+
+Administrators may send `{"override_limits": true}` with the start or
+restart; the override is audited. `GET /capacity` reports usage.
+
+Custom actions:
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" https://servers.example.com/api/v1/servers/minecraft_survival/actions
+```
+
+```bash
+curl -s -X POST -H "Authorization: Bearer $TOKEN" https://servers.example.com/api/v1/servers/minecraft_survival/actions/save_world/run
+```
+
+The list contains only the actions you may run (name, description, icon,
+whether confirmation is needed, current and last run) — never what they
+execute. Actions with `"confirm": true` need the body `{"confirm": true}`.
+The result arrives as a `server.action.completed` event.
 
 | Route | Permission |
 |---|---|
@@ -85,9 +116,15 @@ is `null`. `GET /servers/{id}/operations` returns the history with outcomes.
 | `POST …/stop`, `POST …/restart` | STOP |
 | `GET …/console`, `GET …/console/stream` | CONSOLE_READ |
 | `POST …/console/command` | CONSOLE_WRITE |
-| `GET/POST …/backups`, `POST …/backups/{name}/download` | BACKUPS |
+| `GET …/backups` | BACKUP_CREATE or BACKUP_DOWNLOAD (files only with BACKUP_DOWNLOAD) |
+| `POST …/backups`, `POST …/backups/cancel` | BACKUP_CREATE |
+| `POST …/backups/{name}/download` | BACKUP_DOWNLOAD |
+| `GET …/actions`, `GET /capacity` | any permission on the server / signed in |
+| `POST …/actions/{aid}/run` | access to the server **and** a grant for that action |
+| `GET/PUT /me/notifications`, `POST /me/email/verification` | signed in |
+| `POST /auth/password/forgot`, `…/reset/check`, `…/reset` | public (regular accounts only; neutral answers) |
 | `GET/PUT …/config` | CONFIG (execution settings: administrators) |
-| `POST /servers`, `DELETE /servers/{id}`, `/admin/*` | administrator |
+| `POST /servers`, `DELETE /servers/{id}`, action CRUD (`POST/PUT/DELETE …/actions`), `/admin/*` (incl. categories and action grants) | administrator |
 
 ## Real-time streams (Server-Sent Events)
 
@@ -109,7 +146,12 @@ data: {"server_id":"minecraft_survival","state":"RUNNING","message":"","since":"
 ```
 
 - You only receive events you are authorized for (administrators: all; users:
-  servers they hold permissions on).
+  servers they hold permissions on; `server.action.*` only for actions you
+  may run).
+- Events include `server.status.changed`, `server.operation.*`,
+  `server.backups.changed`, `server.action.started` / `.completed`,
+  `capacity.changed` (refetch `GET /capacity`), `categories.changed`,
+  `permissions.changed`, and administrator-only list changes.
 - Events carry minimal data; re-fetch details through the API.
 - Reconnect with `Last-Event-ID`. If the gap can be replayed, `hello` has
   `"resync": false` and the missed events follow. Otherwise `"resync": true`

@@ -2,7 +2,7 @@
   "id": "source_engine",
   "name": "Source engine server",
   "description": "Forking server tracked through its PID file. Readiness uses a UDP probe: the A2S_INFO query, which the server answers once it is up.",
-  "category": "Source",
+  "category": "source",
   "backend": "custom",
   "working_dir": "/opt/srcds",
   "custom": {

@@ -4,7 +4,7 @@ import * as api from '../api.js';
 import * as store from '../store.js';
 import { h, replace, loading, errorBox, chip, actionButton, field, fmtTime, emptyState } from '../ui.js';
 
-const RESULT_CHIP = { SUCCESS: 'chip-ok', FAILURE: 'chip-bad', DENIED: 'chip-warn', REQUESTED: 'chip-op' };
+const RESULT_CHIP = { SUCCESS: 'chip-ok', FAILURE: 'chip-bad', DENIED: 'chip-warn', REQUESTED: 'chip-op', SUBMITTED: 'chip-backend' };
 
 function detailText(details) {
   const parts = [];
@@ -25,7 +25,7 @@ export function auditPage() {
   const server = h('select', null, h('option', { value: '' }, 'Any server'),
     store.sortedServers().map((s) => h('option', { value: s.id }, s.name)));
   const action = h('select', null, h('option', { value: '' }, 'Any action'));
-  const result = h('select', null, ['', 'SUCCESS', 'FAILURE', 'DENIED', 'REQUESTED'].map((r) => h('option', { value: r }, r || 'Any result')));
+  const result = h('select', null, ['', 'SUCCESS', 'FAILURE', 'DENIED', 'REQUESTED', 'SUBMITTED'].map((r) => h('option', { value: r }, r || 'Any result')));
   const from = h('input', { type: 'datetime-local' });
   const to = h('input', { type: 'datetime-local' });
   const tbody = h('tbody');

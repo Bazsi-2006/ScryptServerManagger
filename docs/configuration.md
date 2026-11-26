@@ -57,6 +57,7 @@ Relative paths are resolved against the directory of the configuration file.
 | `refresh_token_ttl` | `720h` | A session ends after this long without use. |
 | `invitation_ttl` | `72h` | Default validity of invitations. |
 | `email_change_ttl` | `24h` | Validity of email verification links. |
+| `password_reset_ttl` | `1h` | Validity of emailed password reset links (5m–24h). Email reset is never available to administrators. |
 | `min_password_length` | `10` | Minimum password length (8–128). |
 | `cookie_secure` | `"auto"` | `auto` = Secure when served over HTTPS; `always`; `never`. |
 | `jwt_secret_file` | `<secrets_dir>/jwt.key` | Signing key file; generated on first start. *restart* |
@@ -86,6 +87,8 @@ N requests that refills over the window.
 | `server_stop` | 6 / 1m | user + server (a restart counts against both) |
 | `console_command` | 60 / 1m | user + server |
 | `backup_create` | 3 / 5m | user + server |
+| `action_run` | 20 / 1m | user + server (custom actions) |
+| `password_reset` | 5 / 15m | client address, and separately the email address (reset requests); user (verification emails) |
 | `server_cooldown` | `3s` | Minimum pause after a start/stop/restart of a server before the next one, for everybody. `0s` disables it. A server can override it. |
 
 Rate limits are in addition to — never instead of — operation locking and
@@ -111,6 +114,50 @@ permission checks.
 | `audit.retention_days` | `0` | Delete audit entries older than this (0 = keep forever). |
 | `security.max_request_bytes` | `1048576` | Largest accepted request body. |
 | `security.config_permission_full_access` | `false` | See [security.md](security.md#the-config-permission). Leave off. |
+
+### `limits` and `categories` — concurrent servers
+
+```json
+"limits": { "max_concurrent_servers": 5 },
+"categories": [
+  { "id": "minecraft", "name": "Minecraft", "description": "Java servers", "max_concurrent": 2 },
+  { "id": "source", "name": "Source Engine", "max_concurrent": 3 }
+]
+```
+
+| Field | Default | Meaning |
+|---|---|---|
+| `limits.max_concurrent_servers` | `0` | How many servers may be active at once across the whole installation (0 = unlimited). |
+| `categories[].id` | — | Permanent identifier (`a-z`, `0-9`, `_`, `-`); server definitions refer to it in `category`. |
+| `categories[].name` | — | Display name, unique (case-insensitive). |
+| `categories[].max_concurrent` | `0` | Limit for the servers of this category (0 = unlimited). |
+
+Both are usually managed on the **Limits** page. Both limits apply at the same
+time: a start is refused when either is reached. A server counts while it is
+STARTING, RUNNING or STOPPING and keeps its slot until it is confirmed
+stopped; a server in ERROR or UNKNOWN keeps whatever the last conclusive
+observation said (a server whose state cannot be determined is never assumed
+to have stopped). Servers started outside Server Manager count as soon as
+monitoring sees them. The check and the reservation of the slot happen
+atomically, so two simultaneous starts can never take the same last slot.
+Limits apply to administrators too; an administrator can explicitly override
+a limit from the dialog that explains it, and the override is audited.
+
+A definition's `category` may also contain a category *name* (definitions
+written before categories were managed do); it is matched case-insensitively.
+Creating or renaming a category rewrites such definitions to use the ID.
+Category values that match no managed category still group servers on the
+dashboard but have no limit.
+
+### `notifications`
+
+| Field | Default | Meaning |
+|---|---|---|
+| `notifications.enabled` | `true` | Global switch for server activity emails. Users still opt in individually in their profile. |
+| `notifications.cooldown` | `10m` | Repeated emails of the same kind about the same server within this time are suppressed (and counted in the next one). `0s` disables the cooldown. |
+
+Notifications use the SMTP settings above (and are printed to the log in
+development mode). Nothing is sent when SMTP is not configured.
 
 ### `tools` (*restart*)
 
@@ -149,13 +196,15 @@ Examples for every backend are in [examples/servers/](../examples/servers).
 |---|---|
 | `id` | Permanent identifier: 1–63 characters of `a-z`, `0-9`, `_`, `-`. |
 | `name` | Display name. |
-| `description`, `category` | Optional; category groups servers on the dashboard. |
+| `description` | Optional. |
+| `category` | Optional category ID (see [`categories`](#limits-and-categories--concurrent-servers)); groups servers and decides which concurrency limit applies. Only administrators can change it. |
 | `backend` | `custom`, `tmux`, `systemd` or `docker`. |
 | `working_dir` | Absolute working directory for the server's commands. |
-| `env` | Extra environment variables for every command of this server. |
+| `env` | Extra environment variables for every command of this server. Not shown in the web form (set variables in your start scripts or service configuration instead); existing values keep working and can still be edited in the JSON view. |
 | `readiness` | How to tell STARTING from RUNNING (below). |
 | `console` | Console input method (below). |
-| `backup` | Optional backup directory and command (below). |
+| `backup` | Optional backups: a directory plus a command or a tmux console command (below). |
+| `actions` | Optional custom actions users can be allowed to run (below). |
 | `timeouts` | `start` (2m), `stop` (1m), `backup` (1h), `command` (15s). |
 | `cooldown` | Overrides `rate_limits.server_cooldown` for this server. |
 | `status_poll_interval` | Overrides `monitoring.status_poll_interval`. |
@@ -384,19 +433,82 @@ pane sitting at a shell prompt will run what is typed into it.
   `SM_BACKUP_DIR` and `SM_SERVER_ID`, is limited by `timeouts.backup` and can
   be cancelled. Write to a temporary name and rename when done so incomplete
   files are never offered (see [examples/scripts/backup.sh](../examples/scripts/backup.sh)).
-- `allow_user_delete` — let holders of BACKUPS delete files; otherwise only
-  administrators can.
+- `allow_user_delete` — let holders of BACKUP_DOWNLOAD delete files;
+  otherwise only administrators can.
 
-One operation runs per server at a time, so a backup and a start/stop never
-overlap.
+**Sending a command to the tmux session** (`"method": "tmux"`, tmux backend
+only) is for game servers that make backups from their own console:
+
+```json
+"backup": {
+  "method": "tmux",
+  "directory": "/opt/minecraft/backups",
+  "tmux": { "text": "/backup start", "enter": true },
+  "completion": { "pattern": "Backup complete", "regex": false }
+}
+```
+
+- `tmux.text` — typed literally into the server's configured session/pane
+  (`send-keys -l`: tmux key names and shell syntax are not interpreted), one
+  line without control characters. `enter` (default `true`) presses Enter
+  afterwards. The session must exist, otherwise the request is refused with
+  an explanation.
+- `directory` — optional for this method; where the server writes its
+  backups. New files are listed as soon as they appear.
+- `completion` — optional. Delivering the command does not mean the backup
+  has finished. Without a completion pattern the operation ends as
+  **submitted** ("the command was sent; completion cannot be verified") and
+  the file list refreshes by itself while the server writes. With a pattern,
+  the operation waits (up to `timeouts.backup`) for a matching console line
+  produced after the command was sent, and succeeds or fails accordingly.
+
+Starting a backup needs BACKUP_CREATE; listing and downloading files needs
+BACKUP_DOWNLOAD. One operation runs per server at a time, so a backup and a
+start/stop never overlap.
+
+### `actions` — custom actions
+
+Custom actions are administrator-defined command modules shown as buttons on
+the server page. Users run them only when an administrator grants them that
+specific action (Access tab), and they can never change what is executed.
+
+```json
+"actions": [
+  { "id": "save_world", "name": "Save World", "icon": "💾",
+    "description": "Forces the server to save its world.",
+    "method": "tmux", "tmux": { "text": "save-all flush", "enter": true } },
+  { "id": "update", "name": "Update Server",
+    "method": "command", "command": { "command": "/opt/minecraft/update.sh", "args": ["--channel", "stable"] },
+    "working_dir": "/opt/minecraft", "timeout": "15m", "confirm": true }
+]
+```
+
+| Field | Meaning |
+|---|---|
+| `id` | Unique within the server: 1–63 characters of `a-z`, `0-9`, `_`, `-`. Permission grants refer to it. |
+| `name`, `description`, `icon` | What users see. `icon` is a short symbol such as an emoji. |
+| `method` | `command` (run a program) or `tmux` (type text into the server's tmux session; tmux backend only). |
+| `command` | For `command`: executable and argument list, run directly (no shell) with the server's environment plus `SM_ACTION_ID` and `SM_ACTION_USER`. |
+| `working_dir` | For `command`: defaults to the server's `working_dir`. |
+| `timeout` | For `command`: default `10m`; the process group is killed after it. |
+| `tmux` | For `tmux`: `{ "text": ..., "enter": true }`, as for tmux backups. |
+| `confirm` | Ask for confirmation before running (the API requires `{"confirm": true}`). |
+| `disabled` | Hide the action from users and refuse to run it. |
+
+Runs happen in the background. Script actions report success (exit 0) or
+failure with the tail of their output; tmux actions report **submitted**,
+because whether the server acted on the text cannot be verified. Each action
+runs at most once at a time per server, runs are rate limited
+(`rate_limits.action_run`), recorded in the operation history and the audit
+log, and their results are pushed to the users who may run them.
 
 ## What can be changed while a server is running
 
-The name, description, category, timeouts, cooldown, polling intervals and the
-console readiness pattern can be changed at any time. Anything that affects
-execution (backend, commands, paths, environment, console input, backups) is
-refused until the server is stopped, so the manager never loses track of a
-running server.
+The name, description, category, timeouts, cooldown, polling intervals, the
+console readiness pattern, the backup settings and the custom actions can be
+changed at any time. Anything that controls the server process (backend,
+commands, paths, environment, console input) is refused until the server is
+stopped, so the manager never loses track of a running server.
 
 Deleting a definition removes the JSON file and the server's permission
-assignments. It never deletes the server's own files.
+assignments and action grants. It never deletes the server's own files.

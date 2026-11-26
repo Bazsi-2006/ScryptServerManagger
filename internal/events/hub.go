@@ -30,6 +30,10 @@ const (
 	// AudienceMetrics: administrators, plus everyone when host metrics are
 	// enabled for regular users.
 	AudienceMetrics
+	// AudienceAction: administrators and users who may run the custom
+	// action ActionID of ServerID (an explicit grant plus access to the
+	// server).
+	AudienceAction
 )
 
 // Event is a notification. Data should be minimal: clients re-fetch details
@@ -40,6 +44,7 @@ type Event struct {
 	ServerID string
 	UserID   int64
 	Perm     perm.Mask
+	ActionID string
 	Data     any
 }
 
@@ -58,6 +63,8 @@ type Identity struct {
 	SessionID string
 	IsAdmin   bool
 	Perms     map[string]perm.Mask
+	// Actions holds the custom action grants: server ID -> action IDs.
+	Actions map[string]map[string]bool
 }
 
 // Resolver reloads a subscriber's identity. ok=false means the subscriber is
@@ -150,6 +157,11 @@ func (h *Hub) allowed(id *Identity, ev *Event) bool {
 		return true
 	case AudienceMetrics:
 		return id.IsAdmin || (h.metricsU != nil && h.metricsU())
+	case AudienceAction:
+		if id.IsAdmin {
+			return true
+		}
+		return id.Perms[ev.ServerID].Any() && id.Actions[ev.ServerID][ev.ActionID]
 	}
 	return false
 }

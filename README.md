@@ -33,10 +33,21 @@ embedded. No language runtime, no Node.js, no external database.
   passwords, short-lived JWT access tokens, rotating refresh tokens in
   `HttpOnly` cookies with server-side sessions and reuse detection.
 - **Per-server permission bitmask** (START, STOP, CONSOLE_READ, CONSOLE_WRITE,
-  BACKUPS, CONFIG) with implied permissions, enforced on every API route and
-  on every event.
-- **Backups**: run a configured backup command as a tracked operation; list
-  and download files with traversal- and symlink-safe access.
+  CONFIG, BACKUP_CREATE, BACKUP_DOWNLOAD) with implied permissions, plus
+  per-action grants, enforced on every API route and on every event.
+- **Backups**: run a configured backup command, or type a backup command
+  such as `/backup start` into a tmux server's console (reported as
+  *submitted* unless a completion message confirms it); list and download
+  files with traversal- and symlink-safe access. Starting backups and
+  downloading them are separate permissions.
+- **Custom actions**: administrator-defined buttons per server ("Save World",
+  "Update Server", …) that run a fixed script or type a fixed tmux command,
+  granted to users one by one — without giving them console access.
+- **Concurrency limits**: a global maximum of running servers plus a limit
+  per category, enforced atomically, with live usage on the dashboard.
+- **Email notifications** (opt-in, verified addresses only) when servers
+  become ready, stop, crash or fail to start/stop, and **email password
+  reset** for regular users (never for administrators).
 - **Real-time UI**: status, permission and configuration changes reach every
   connected browser without reloads.
 - **Host monitoring** (CPU, memory) from `/proc`, refreshed every 5 seconds.
@@ -109,6 +120,7 @@ internal/
   monitor/              host CPU and memory sampling
   mail/                 SMTP delivery (or log output in development)
   audit/                audit trail recorder
+  notify/               server activity email notifications
   ratelimit/            token buckets and cooldowns
   logging/              application log setup
 web/static/             frontend (plain ES modules and CSS, embedded at build time)

@@ -54,12 +54,23 @@ func (s *Server) handleGetUser(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
+	grants, err := s.Store.ActionPermissionsForUser(r.Context(), uid)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	actions := map[string][]string{}
+	for srv, set := range grants {
+		for a := range set {
+			actions[srv] = append(actions[srv], a)
+		}
+	}
 	sessions, err := s.sessionViews(r.Context(), uid, s.ident(r).SessionID)
 	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"user": u, "permissions": perms, "sessions": sessions})
+	writeJSON(w, http.StatusOK, map[string]any{"user": u, "permissions": perms, "action_permissions": actions, "sessions": sessions})
 }
 
 func (s *Server) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
@@ -187,9 +198,12 @@ func (s *Server) handleSetPermission(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Mask == nil || !perm.Mask(*req.Mask).Valid() {
-		s.fail(w, r, badRequest("mask must be a combination of the defined permission bits (0-%d).", int(perm.All)))
+		s.fail(w, r, badRequest("mask must be a combination of the defined permission bits (START=1, STOP=2, CONSOLE_READ=4, CONSOLE_WRITE=8, CONFIG=32, BACKUP_CREATE=64, BACKUP_DOWNLOAD=128)."))
 		return
 	}
+	// The legacy BACKUPS bit (16) is stored as BACKUP_CREATE|BACKUP_DOWNLOAD.
+	mask := int(perm.Mask(*req.Mask).Normalize())
+	req.Mask = &mask
 	u, err := s.Store.UserByID(r.Context(), uid)
 	if err != nil {
 		s.fail(w, r, err)
@@ -242,19 +256,38 @@ func (s *Server) handleServerPermissions(w http.ResponseWriter, r *http.Request)
 	for _, p := range perms {
 		masks[p.UserID] = p.Mask
 	}
+	grants, err := s.Store.ActionPermissionsForServer(r.Context(), serverID)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	byUser := actionGrantsByUser(grants)
 	type row struct {
-		UserID      int64  `json:"user_id"`
-		Username    string `json:"username"`
-		DisplayName string `json:"display_name"`
-		Disabled    bool   `json:"disabled"`
-		IsAdmin     bool   `json:"is_admin"`
-		Mask        int    `json:"mask"`
+		UserID      int64    `json:"user_id"`
+		Username    string   `json:"username"`
+		DisplayName string   `json:"display_name"`
+		Disabled    bool     `json:"disabled"`
+		IsAdmin     bool     `json:"is_admin"`
+		Mask        int      `json:"mask"`
+		Actions     []string `json:"actions"`
 	}
 	out := []row{}
 	for _, u := range users {
-		out = append(out, row{UserID: u.ID, Username: u.Username, DisplayName: u.DisplayName, Disabled: u.Disabled, IsAdmin: u.IsAdmin, Mask: masks[u.ID]})
+		acts := byUser[u.ID]
+		if acts == nil {
+			acts = []string{}
+		}
+		out = append(out, row{UserID: u.ID, Username: u.Username, DisplayName: u.DisplayName, Disabled: u.Disabled, IsAdmin: u.IsAdmin,
+			Mask: int(perm.Mask(masks[u.ID]).Normalize()), Actions: acts})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"permissions": out})
+	def, _ := s.Manager.Definition(serverID)
+	actions := []actionView{}
+	if def != nil {
+		for _, a := range def.Actions {
+			actions = append(actions, actionView{ID: a.ID, Name: a.Name, Description: a.Description, Icon: a.Icon, Method: a.Method, Confirm: a.Confirm, Disabled: a.Disabled})
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"permissions": out, "actions": actions})
 }
 
 func (s *Server) handleRevokeUserSessions(w http.ResponseWriter, r *http.Request) {
@@ -538,18 +571,20 @@ func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request) {
 // secrets: passwords and signing keys live in the environment or secret
 // files and are never sent to clients.
 type settingsView struct {
-	PublicURL      string            `json:"public_url"`
-	TrustedProxies []string          `json:"trusted_proxies"`
-	Auth           settingsAuth      `json:"auth"`
-	SMTP           settingsSMTP      `json:"smtp"`
-	CORS           config.CORS       `json:"cors"`
-	RateLimits     config.RateLimits `json:"rate_limits"`
-	Monitoring     config.Monitoring `json:"monitoring"`
-	Console        config.Console    `json:"console"`
-	Backups        config.Backups    `json:"backups"`
-	Logging        settingsLogging   `json:"logging"`
-	Audit          config.Audit      `json:"audit"`
-	Security       config.Security   `json:"security"`
+	PublicURL      string               `json:"public_url"`
+	TrustedProxies []string             `json:"trusted_proxies"`
+	Auth           settingsAuth         `json:"auth"`
+	SMTP           settingsSMTP         `json:"smtp"`
+	CORS           config.CORS          `json:"cors"`
+	RateLimits     config.RateLimits    `json:"rate_limits"`
+	Monitoring     config.Monitoring    `json:"monitoring"`
+	Console        config.Console       `json:"console"`
+	Backups        config.Backups       `json:"backups"`
+	Logging        settingsLogging      `json:"logging"`
+	Audit          config.Audit         `json:"audit"`
+	Security       config.Security      `json:"security"`
+	Limits         config.Limits        `json:"limits"`
+	Notifications  config.Notifications `json:"notifications"`
 }
 
 type settingsAuth struct {
@@ -557,6 +592,7 @@ type settingsAuth struct {
 	RefreshTokenTTL   config.Duration `json:"refresh_token_ttl"`
 	InvitationTTL     config.Duration `json:"invitation_ttl"`
 	EmailChangeTTL    config.Duration `json:"email_change_ttl"`
+	PasswordResetTTL  config.Duration `json:"password_reset_ttl"`
 	MinPasswordLength int             `json:"min_password_length"`
 	CookieSecure      string          `json:"cookie_secure"`
 }
@@ -577,11 +613,11 @@ func viewSettings(c *config.Config) settingsView {
 	return settingsView{
 		PublicURL: c.PublicURL, TrustedProxies: append([]string{}, c.TrustedProxies...),
 		Auth: settingsAuth{AccessTokenTTL: c.Auth.AccessTokenTTL, RefreshTokenTTL: c.Auth.RefreshTokenTTL, InvitationTTL: c.Auth.InvitationTTL,
-			EmailChangeTTL: c.Auth.EmailChangeTTL, MinPasswordLength: c.Auth.MinPasswordLength, CookieSecure: c.Auth.CookieSecure},
+			EmailChangeTTL: c.Auth.EmailChangeTTL, PasswordResetTTL: c.Auth.PasswordResetTTL, MinPasswordLength: c.Auth.MinPasswordLength, CookieSecure: c.Auth.CookieSecure},
 		SMTP: settingsSMTP{Host: c.SMTP.Host, Port: c.SMTP.Port, Username: c.SMTP.Username, From: c.SMTP.From, TLS: c.SMTP.TLS},
 		CORS: config.CORS{AllowedOrigins: append([]string{}, c.CORS.AllowedOrigins...)}, RateLimits: c.RateLimits,
 		Monitoring: c.Monitoring, Console: c.Console, Backups: c.Backups, Logging: settingsLogging{Level: c.Logging.Level},
-		Audit: c.Audit, Security: c.Security,
+		Audit: c.Audit, Security: c.Security, Limits: c.Limits, Notifications: c.Notifications,
 	}
 }
 
@@ -608,7 +644,8 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 	var req settingsView
 	// Start from the current values so omitted sections stay unchanged.
-	req = viewSettings(s.Config.Get())
+	before := s.Config.Get()
+	req = viewSettings(before)
 	if err := s.decode(w, r, &req); err != nil {
 		s.fail(w, r, err)
 		return
@@ -619,12 +656,14 @@ func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 		c.Auth.AccessTokenTTL, c.Auth.RefreshTokenTTL = req.Auth.AccessTokenTTL, req.Auth.RefreshTokenTTL
 		c.Auth.InvitationTTL, c.Auth.EmailChangeTTL = req.Auth.InvitationTTL, req.Auth.EmailChangeTTL
 		c.Auth.MinPasswordLength, c.Auth.CookieSecure = req.Auth.MinPasswordLength, req.Auth.CookieSecure
+		c.Auth.PasswordResetTTL = req.Auth.PasswordResetTTL
 		c.SMTP.Host, c.SMTP.Port, c.SMTP.Username = strings.TrimSpace(req.SMTP.Host), req.SMTP.Port, req.SMTP.Username
 		c.SMTP.From, c.SMTP.TLS = strings.TrimSpace(req.SMTP.From), req.SMTP.TLS
 		c.CORS = req.CORS
 		c.RateLimits, c.Monitoring, c.Console, c.Backups = req.RateLimits, req.Monitoring, req.Console, req.Backups
 		c.Logging.Level = req.Logging.Level
 		c.Audit, c.Security = req.Audit, req.Security
+		c.Limits, c.Notifications = req.Limits, req.Notifications
 		return nil
 	})
 	if err != nil {
@@ -642,6 +681,9 @@ func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 		s.SetLevel(s.Config.Get().Logging.Level)
 	}
 	s.Audit.Record(s.actor(r), "", audit.SettingsUpdate, audit.Success, nil)
+	if before.Limits != s.Config.Get().Limits {
+		s.Manager.NotifyCapacityChanged()
+	}
 	s.notifyAdmins("settings.changed")
 	writeJSON(w, http.StatusOK, s.settingsPayload())
 }

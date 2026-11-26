@@ -147,6 +147,14 @@ func (s *Server) toAPIError(err error) *apiError {
 	if errors.As(err, &ie) {
 		return badRequest("%s", capitalize(ie.Msg)+".")
 	}
+	var le *manager.LimitError
+	if errors.As(err, &le) {
+		return &apiError{Status: http.StatusConflict, Code: "concurrency_limit", Message: "Cannot start the server: " + le.Error() + ".", Details: le}
+	}
+	var abe *manager.ActionBusyError
+	if errors.As(err, &abe) {
+		return &apiError{Status: http.StatusConflict, Code: "action_running", Message: capitalize(abe.Error()) + ".", Details: map[string]any{"run": abe.Run}}
+	}
 	var mbe *http.MaxBytesError
 	if errors.As(err, &mbe) {
 		return errf(http.StatusRequestEntityTooLarge, "request_too_large", "The request body is too large.")
@@ -157,7 +165,21 @@ func (s *Server) toAPIError(err error) *apiError {
 	case errors.Is(err, manager.ErrAlreadyRunning):
 		return errf(http.StatusConflict, "already_running", "The server is already running.")
 	case errors.Is(err, manager.ErrNotRunning), errors.Is(err, backend.ErrNotRunning):
-		return errf(http.StatusConflict, "not_running", "The server is not running.")
+		msg := "The server is not running."
+		// Keep a more specific explanation (for example which tmux session
+		// is missing) when the error carries one.
+		if e := err.Error(); e != manager.ErrNotRunning.Error() && e != backend.ErrNotRunning.Error() {
+			msg = capitalize(strings.TrimPrefix(e, backend.ErrNotRunning.Error()+": ")) + "."
+		}
+		return errf(http.StatusConflict, "not_running", "%s", msg)
+	case errors.Is(err, manager.ErrActionNotFound):
+		return errf(http.StatusNotFound, "not_found", "The custom action was not found.")
+	case errors.Is(err, manager.ErrActionExists):
+		return errf(http.StatusConflict, "already_exists", "A custom action with this ID already exists for this server.")
+	case errors.Is(err, manager.ErrActionDisabled):
+		return errf(http.StatusConflict, "action_disabled", "This action is disabled.")
+	case errors.Is(err, manager.ErrConfirmationRequired):
+		return errf(http.StatusConflict, "confirmation_required", "This action must be confirmed before it runs (send {\"confirm\": true}).")
 	case errors.Is(err, manager.ErrActive):
 		return errf(http.StatusConflict, "server_active", "The server is running or busy. Stop it before changing execution settings or deleting it.")
 	case errors.Is(err, servers.ErrExists):

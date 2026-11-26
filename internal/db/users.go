@@ -4,37 +4,50 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"time"
 )
 
 type User struct {
-	ID           int64      `json:"id"`
-	Username     string     `json:"username"`
-	DisplayName  string     `json:"display_name"`
-	Email        string     `json:"email"`
-	PasswordHash string     `json:"-"`
-	IsAdmin      bool       `json:"is_admin"`
-	Disabled     bool       `json:"disabled"`
-	CreatedAt    time.Time  `json:"created_at"`
-	UpdatedAt    time.Time  `json:"updated_at"`
-	LastLoginAt  *time.Time `json:"last_login_at"`
+	ID           int64  `json:"id"`
+	Username     string `json:"username"`
+	DisplayName  string `json:"display_name"`
+	Email        string `json:"email"`
+	PasswordHash string `json:"-"`
+	IsAdmin      bool   `json:"is_admin"`
+	Disabled     bool   `json:"disabled"`
+	// EmailVerifiedAt is set once the owner proved they receive mail at
+	// Email (nil = unverified). Only verified addresses receive
+	// notifications or password reset links.
+	EmailVerifiedAt *time.Time `json:"email_verified_at"`
+	EmailVerified   bool       `json:"email_verified"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
+	LastLoginAt     *time.Time `json:"last_login_at"`
 }
 
-const userCols = `id, username, display_name, COALESCE(email,''), password_hash, is_admin, disabled, created_at, updated_at, last_login_at`
+const userCols = `id, username, display_name, COALESCE(email,''), password_hash, is_admin, disabled, created_at, updated_at, last_login_at, email_verified_at`
+
+// userColsU is userCols for queries that alias users as "u".
+const userColsU = `u.id, u.username, u.display_name, COALESCE(u.email,''), u.password_hash, u.is_admin, u.disabled, u.created_at, u.updated_at, u.last_login_at, u.email_verified_at`
 
 type scanner interface{ Scan(dest ...any) error }
 
 func scanUser(r scanner) (*User, error) {
 	var u User
 	var created, updated int64
-	var last sql.NullInt64
-	if err := r.Scan(&u.ID, &u.Username, &u.DisplayName, &u.Email, &u.PasswordHash, &u.IsAdmin, &u.Disabled, &created, &updated, &last); err != nil {
+	var last, verified sql.NullInt64
+	if err := r.Scan(&u.ID, &u.Username, &u.DisplayName, &u.Email, &u.PasswordHash, &u.IsAdmin, &u.Disabled, &created, &updated, &last, &verified); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
 		return nil, err
 	}
 	u.CreatedAt, u.UpdatedAt, u.LastLoginAt = fromUnix(created), fromUnix(updated), fromNullUnix(last)
+	if u.Email != "" {
+		u.EmailVerifiedAt = fromNullUnix(verified)
+	}
+	u.EmailVerified = u.EmailVerifiedAt != nil
 	return &u, nil
 }
 
@@ -42,9 +55,20 @@ type execer interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 }
 
+func nullTime(t *time.Time) sql.NullInt64 {
+	if t == nil {
+		return sql.NullInt64{}
+	}
+	return sql.NullInt64{Int64: t.Unix(), Valid: true}
+}
+
 func insertUser(ctx context.Context, e execer, u *User, now time.Time) error {
-	res, err := e.ExecContext(ctx, `INSERT INTO users(username, display_name, email, password_hash, is_admin, disabled, created_at, updated_at)
-		VALUES (?,?,?,?,?,?,?,?)`, u.Username, u.DisplayName, nullStr(u.Email), u.PasswordHash, u.IsAdmin, u.Disabled, unix(now), unix(now))
+	if u.Email == "" {
+		u.EmailVerifiedAt = nil
+	}
+	u.EmailVerified = u.EmailVerifiedAt != nil
+	res, err := e.ExecContext(ctx, `INSERT INTO users(username, display_name, email, password_hash, is_admin, disabled, created_at, updated_at, email_verified_at)
+		VALUES (?,?,?,?,?,?,?,?,?)`, u.Username, u.DisplayName, nullStr(u.Email), u.PasswordHash, u.IsAdmin, u.Disabled, unix(now), unix(now), nullTime(u.EmailVerifiedAt))
 	if err != nil {
 		if isUniqueViolation(err) {
 			return ErrConflict
@@ -67,6 +91,14 @@ func (s *Store) UserByID(ctx context.Context, id int64) (*User, error) {
 
 func (s *Store) UserByUsername(ctx context.Context, username string) (*User, error) {
 	return scanUser(s.DB.QueryRowContext(ctx, `SELECT `+userCols+` FROM users WHERE username = ?`, username))
+}
+
+// UserByEmail finds the account with this address (case-insensitive).
+func (s *Store) UserByEmail(ctx context.Context, email string) (*User, error) {
+	if email == "" {
+		return nil, ErrNotFound
+	}
+	return scanUser(s.DB.QueryRowContext(ctx, `SELECT `+userCols+` FROM users WHERE email = ?`, email))
 }
 
 func (s *Store) ListUsers(ctx context.Context) ([]*User, error) {
@@ -94,11 +126,14 @@ func (s *Store) CountUsers(ctx context.Context) (int, error) {
 
 // UserUpdate lists optional changes to a user row; nil fields are untouched.
 type UserUpdate struct {
-	DisplayName  *string
-	Email        *string // empty string clears the address
-	PasswordHash *string
-	IsAdmin      *bool
-	Disabled     *bool
+	DisplayName *string
+	// Email sets the address (empty string clears it). A changed address is
+	// unverified unless EmailVerified says otherwise.
+	Email         *string
+	EmailVerified *bool
+	PasswordHash  *string
+	IsAdmin       *bool
+	Disabled      *bool
 }
 
 var ErrLastAdmin = errors.New("cannot remove the last active administrator")
@@ -113,12 +148,29 @@ func (s *Store) UpdateUser(ctx context.Context, id int64, up UserUpdate) (*User,
 			return err
 		}
 		wasActiveAdmin := u.IsAdmin && !u.Disabled
+		wasAdmin, oldEmail, oldHash := u.IsAdmin, u.Email, u.PasswordHash
+		now := time.Now()
 		if up.DisplayName != nil {
 			u.DisplayName = *up.DisplayName
 		}
 		if up.Email != nil {
 			u.Email = *up.Email
+			if !strings.EqualFold(u.Email, oldEmail) {
+				u.EmailVerifiedAt = nil
+			}
 		}
+		if up.EmailVerified != nil {
+			if !*up.EmailVerified {
+				u.EmailVerifiedAt = nil
+			} else if u.EmailVerifiedAt == nil {
+				t := now.UTC().Truncate(time.Second)
+				u.EmailVerifiedAt = &t
+			}
+		}
+		if u.Email == "" {
+			u.EmailVerifiedAt = nil
+		}
+		u.EmailVerified = u.EmailVerifiedAt != nil
 		if up.PasswordHash != nil {
 			u.PasswordHash = *up.PasswordHash
 		}
@@ -137,13 +189,21 @@ func (s *Store) UpdateUser(ctx context.Context, id int64, up UserUpdate) (*User,
 				return ErrLastAdmin
 			}
 		}
-		now := time.Now()
-		if _, err := tx.ExecContext(ctx, `UPDATE users SET display_name=?, email=?, password_hash=?, is_admin=?, disabled=?, updated_at=? WHERE id=?`,
-			u.DisplayName, nullStr(u.Email), u.PasswordHash, u.IsAdmin, u.Disabled, unix(now), id); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE users SET display_name=?, email=?, password_hash=?, is_admin=?, disabled=?, email_verified_at=?, updated_at=? WHERE id=?`,
+			u.DisplayName, nullStr(u.Email), u.PasswordHash, u.IsAdmin, u.Disabled, nullTime(u.EmailVerifiedAt), unix(now), id); err != nil {
 			if isUniqueViolation(err) {
 				return ErrConflict
 			}
 			return err
+		}
+		// A pending password reset link stops working when the address it
+		// was sent to changes, when the password is changed some other way,
+		// and when the account becomes an administrator (administrators
+		// cannot reset their password by email).
+		if !strings.EqualFold(u.Email, oldEmail) || u.PasswordHash != oldHash || (u.IsAdmin && !wasAdmin) {
+			if err := deleteUnusedResets(ctx, tx, id); err != nil {
+				return err
+			}
 		}
 		u.UpdatedAt = now.UTC().Truncate(time.Second)
 		out = u
@@ -192,6 +252,22 @@ func (s *Store) CreateEmailChange(ctx context.Context, userID int64, newEmail, t
 	})
 }
 
+// PendingEmailChange returns the address awaiting verification, if any.
+func (s *Store) PendingEmailChange(ctx context.Context, userID int64, now time.Time) (string, *time.Time, error) {
+	var email string
+	var expires int64
+	err := s.DB.QueryRowContext(ctx, `SELECT new_email, expires_at FROM email_changes WHERE user_id = ? AND expires_at > ? ORDER BY id DESC LIMIT 1`,
+		userID, unix(now)).Scan(&email, &expires)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil, nil
+	}
+	if err != nil {
+		return "", nil, err
+	}
+	t := fromUnix(expires)
+	return email, &t, nil
+}
+
 // ConsumeEmailChange applies a pending email change identified by its token
 // hash and returns the affected user.
 func (s *Store) ConsumeEmailChange(ctx context.Context, tokenHash string, now time.Time) (*User, error) {
@@ -215,11 +291,21 @@ func (s *Store) ConsumeEmailChange(ctx context.Context, tokenHash string, now ti
 			out = nil
 			return nil
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE users SET email = ?, updated_at = ? WHERE id = ?`, email, unix(now), userID); err != nil {
+		var oldEmail string
+		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(email,'') FROM users WHERE id = ?`, userID).Scan(&oldEmail); err != nil {
+			return err
+		}
+		// Receiving the link proves ownership of the address.
+		if _, err := tx.ExecContext(ctx, `UPDATE users SET email = ?, email_verified_at = ?, updated_at = ? WHERE id = ?`, email, unix(now), unix(now), userID); err != nil {
 			if isUniqueViolation(err) {
 				return ErrConflict
 			}
 			return err
+		}
+		if !strings.EqualFold(oldEmail, email) {
+			if err := deleteUnusedResets(ctx, tx, userID); err != nil {
+				return err
+			}
 		}
 		u, err := scanUser(tx.QueryRowContext(ctx, `SELECT `+userCols+` FROM users WHERE id = ?`, userID))
 		out = u
@@ -289,7 +375,19 @@ func (s *Store) PermissionsForServer(ctx context.Context, serverID string) ([]Se
 	return out, rows.Err()
 }
 
+// DeleteServerPermissions removes every permission, action grant and
+// notification mute that refers to a server.
 func (s *Store) DeleteServerPermissions(ctx context.Context, serverID string) error {
-	_, err := s.DB.ExecContext(ctx, `DELETE FROM server_permissions WHERE server_id = ?`, serverID)
-	return err
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		for _, q := range []string{
+			`DELETE FROM server_permissions WHERE server_id = ?`,
+			`DELETE FROM action_permissions WHERE server_id = ?`,
+			`DELETE FROM notification_mutes WHERE server_id = ?`,
+		} {
+			if _, err := tx.ExecContext(ctx, q, serverID); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }

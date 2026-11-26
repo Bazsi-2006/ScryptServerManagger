@@ -6,7 +6,7 @@ import * as store from '../store.js';
 import { openStream } from '../sse.js';
 import {
   h, replace, statusBadge, chip, loading, errorBox, emptyState, actionButton, confirmDialog, notify,
-  errorMessage, fmtBytes, fmtTime, fmtRelative, withBusy,
+  errorMessage, fmtBytes, fmtTime, fmtRelative, withBusy, openModal,
 } from '../ui.js';
 import { serverActions } from './dashboard.js';
 import { serverForm } from './serverform.js';
@@ -224,16 +224,27 @@ function backupsTab(server) {
   function render() {
     const op = store.state.servers.get(id)?.status.operation;
     const running = op && op.type === 'backup';
+    const tmux = data.method === 'tmux';
+    const count = data.can_list ? `${data.files.length} file${data.files.length === 1 ? '' : 's'}` : '';
     const head = h('div', { class: 'tab-toolbar' },
       h('div', null,
-        running ? h('span', { class: 'chip chip-op' }, h('span', { class: 'spinner spinner-small' }), ` Backup in progress (started ${fmtRelative(op.started_at)} by ${op.user || 'system'})`) : h('span', { class: 'muted' }, `${data.files.length} file${data.files.length === 1 ? '' : 's'}`)),
+        running ? h('span', { class: 'chip chip-op' }, h('span', { class: 'spinner spinner-small' }), ` Backup in progress (started ${fmtRelative(op.started_at)} by ${op.user || 'system'})`) : h('span', { class: 'muted' }, count)),
       h('div', { class: 'page-actions' },
-        running ? actionButton('Cancel backup', 'btn-small btn-danger', async () => { await api.post(`/servers/${api.enc(id)}/backups/cancel`); }) : null,
+        running && data.can_create ? actionButton(tmux ? 'Stop waiting' : 'Cancel backup', 'btn-small btn-danger', async () => { await api.post(`/servers/${api.enc(id)}/backups/cancel`); }) : null,
         data.can_create ? actionButton('Create backup', 'btn-primary', async () => {
           await api.post(`/servers/${api.enc(id)}/backups`);
-          notify.info('Backup started.');
-        }, { disabled: !!op, title: op ? 'Another operation is in progress' : 'Run the configured backup command' }) : null,
-        actionButton('Refresh', 'btn-small', load)));
+          notify.info(tmux ? 'Sending the backup command to the server console…' : 'Backup started.');
+        }, { disabled: !!op, title: op ? 'Another operation is in progress' : (tmux ? 'Send the configured backup command to the server console' : 'Run the configured backup command') }) : null,
+        data.can_list ? actionButton('Refresh', 'btn-small', load) : null));
+    const hints = [];
+    if (data.can_create && tmux) {
+      hints.push(h('p', { class: 'hint' }, 'Backups are started by typing the configured command into the server console. The server decides when the backup is finished; new files appear here automatically as they are written.'));
+    }
+    if (!data.can_list) {
+      replace(box, head, hints, emptyState('Backup files are not shown',
+        data.can_create ? 'You can start backups, but you do not have the BACKUP_DOWNLOAD permission to view or download backup files.' : 'You do not have permission to view backup files.'));
+      return;
+    }
     let list;
     if (data.note && !data.files.length) {
       list = emptyState(data.configured ? 'Backup directory unavailable' : 'Backups are not configured', data.note);
@@ -250,8 +261,8 @@ function backupsTab(server) {
             actionButton('Download', 'btn-small', () => download(f)),
             data.can_delete ? actionButton('Delete', 'btn-small btn-danger', () => remove(f)) : null))))));
     }
-    replace(box, head,
-      !data.can_create && data.configured ? h('p', { class: 'hint' }, 'No backup command is configured, so backups cannot be started from here; existing files can still be downloaded.') : null,
+    replace(box, head, hints,
+      !data.create_supported && data.configured ? h('p', { class: 'hint' }, 'No backup command is configured, so backups cannot be started from here; existing files can still be downloaded.') : null,
       list);
   }
 
@@ -265,7 +276,11 @@ function backupsTab(server) {
 function activityTab(server) {
   const id = server.id;
   const box = h('div', null, loading());
-  const STATUS = { running: 'chip-op', succeeded: 'chip-ok', failed: 'chip-bad', cancelled: '', interrupted: 'chip-warn' };
+  const STATUS = { running: 'chip-op', succeeded: 'chip-ok', submitted: 'chip-backend', failed: 'chip-bad', cancelled: '', interrupted: 'chip-warn' };
+  const actionName = (aid) => {
+    const a = (store.state.servers.get(id)?.actions || []).find((x) => x.id === aid);
+    return a ? a.name : aid;
+  };
   async function load() {
     try {
       const res = await api.get(`/servers/${api.enc(id)}/operations?limit=50`);
@@ -274,7 +289,7 @@ function activityTab(server) {
         h('thead', null, h('tr', null, h('th', null, 'When'), h('th', null, 'Operation'), h('th', null, 'By'), h('th', null, 'Result'), h('th', null, 'Details'))),
         h('tbody', null, res.operations.map((op) => h('tr', null,
           h('td', { class: 'nowrap', title: fmtTime(op.started_at) }, fmtTime(op.started_at)),
-          h('td', null, op.type),
+          h('td', null, op.type === 'action' ? `action: ${actionName(op.action_id)}` : op.type),
           h('td', null, op.username || 'system'),
           h('td', null, chip(op.status, STATUS[op.status] || '')),
           h('td', { class: 'break' }, op.message || (op.finished_at ? `${((new Date(op.finished_at) - new Date(op.started_at)) / 1000).toFixed(1)}s` : ''))))))));
@@ -282,9 +297,96 @@ function activityTab(server) {
       replace(box, errorBox(err, load));
     }
   }
-  const off = store.on('operation:' + id, load);
+  const offs = [store.on('operation:' + id, load), store.on('action:' + id, (ev) => { if (ev.phase === 'finished') load(); })];
   load();
-  return { el: box, destroy: off };
+  return { el: box, destroy: () => offs.forEach((off) => off()) };
+}
+
+// ---- custom actions ----
+
+const RUN_STATUS = { succeeded: ['completed', 'chip-ok'], submitted: ['sent', 'chip-backend'], failed: ['failed', 'chip-bad'], cancelled: ['cancelled', ''], interrupted: ['interrupted', 'chip-warn'], running: ['running', 'chip-op'] };
+
+function showOutput(a, run) {
+  openModal({
+    title: `Output of ${a.name}`, wide: true,
+    body: h('div', null,
+      h('p', { class: 'muted small' }, `${fmtTime(run.started_at)} · ${run.username || 'system'} · ${run.message || run.status}`),
+      // textContent: output is untrusted text.
+      h('pre', { class: 'code output-box' }, run.output || '(no output)')),
+  });
+}
+
+/**
+ * The custom actions the user may run, as compact cards above the tabs.
+ * What an action executes is never shown here; only its name and result.
+ */
+function actionsPanel(server) {
+  const id = server.id;
+  const box = h('section', { class: 'action-panel', hidden: true, 'aria-label': 'Custom actions' });
+  let list = [];
+
+  async function load() {
+    try {
+      list = (await api.get(`/servers/${api.enc(id)}/actions`)).actions;
+      render();
+    } catch (err) {
+      if (err.status !== 404) console.warn('could not load actions', err);
+    }
+  }
+
+  async function run(a, button) {
+    if (a.confirm) {
+      const ok = await confirmDialog({ title: `Run "${a.name}"?`, message: a.description || 'This action will be executed on the server.', confirmLabel: 'Run action', danger: true });
+      if (!ok) return;
+    }
+    await withBusy(button, async () => {
+      try {
+        await api.post(`/servers/${api.enc(id)}/actions/${api.enc(a.id)}/run`, a.confirm ? { confirm: true } : undefined);
+      } catch (err) {
+        notify.error(`${a.name}: ${errorMessage(err)}`);
+      }
+    });
+  }
+
+  function card(a) {
+    const btn = h('button', { class: 'btn btn-small btn-primary', type: 'button', disabled: !!a.running || a.disabled,
+      title: a.disabled ? 'This action is disabled' : (a.running ? 'Already running' : (a.description || 'Run this action')) }, a.running ? 'Running…' : 'Run');
+    btn.addEventListener('click', () => run(a, btn));
+    let status = null;
+    if (a.running) {
+      status = h('div', { class: 'action-status' }, h('span', { class: 'spinner spinner-small' }), ` running since ${fmtRelative(a.running.started_at)} (${a.running.user || 'system'})`);
+    } else if (a.last_run) {
+      const r = a.last_run;
+      const [label, cls] = RUN_STATUS[r.status] || [r.status, ''];
+      status = h('div', { class: 'action-status' }, chip(label, cls), ` ${fmtRelative(r.finished_at || r.started_at)} · ${r.username || 'system'}`,
+        r.output || (r.status === 'failed' && r.message) ? h('button', { class: 'link-btn', type: 'button', onclick: () => showOutput(a, r) }, 'details') : null);
+    }
+    return h('div', { class: 'action-card' + (a.disabled ? ' is-disabled' : '') },
+      h('div', { class: 'action-head' },
+        h('span', { class: 'action-name' }, a.icon ? h('span', { class: 'action-icon', 'aria-hidden': 'true' }, a.icon) : null, a.name,
+          a.disabled ? chip('disabled', 'chip-warn') : null, a.method === 'tmux' ? chip('console', '') : null),
+        btn),
+      a.description ? h('div', { class: 'action-desc' }, a.description) : null,
+      status);
+  }
+
+  function render() {
+    box.hidden = !list.length;
+    if (!list.length) { replace(box); return; }
+    replace(box, h('div', { class: 'action-grid' }, list.map(card)));
+  }
+
+  const offs = [
+    store.on('action:' + id, load),
+    store.on('server-config:' + id, load),
+    store.on('resync', load),
+  ];
+  // Grants change through permissions.changed -> resync; the list in the
+  // server view tells us whether there is anything to load at all.
+  if ((server.actions || []).length) load();
+  // Relative times ("2m ago") stay current.
+  const tick = setInterval(() => { if (list.length) render(); }, 30000);
+  return { el: box, destroy: () => { offs.forEach((off) => off()); clearInterval(tick); } };
 }
 
 // ---- settings tab ----
@@ -371,22 +473,30 @@ function accessTab(server) {
       const res = await api.get(`/servers/${api.enc(id)}/permissions`);
       const users = res.permissions.filter((p) => !p.is_admin);
       const admins = res.permissions.filter((p) => p.is_admin);
+      const actions = res.actions || [];
       if (!users.length) {
         replace(box, emptyState('No regular users', 'Invite users first; administrators already have full access to every server.',
           h('a', { class: 'btn btn-primary', href: '#/admin/invitations' }, 'Manage invitations')));
         return;
       }
       replace(box,
-        h('p', { class: 'hint' }, 'Permissions are denied unless granted here. STOP includes START, and CONSOLE_WRITE includes CONSOLE_READ. Changes take effect immediately, including for users who are currently connected.'),
+        h('p', { class: 'hint' }, 'Permissions are denied unless granted here. STOP includes START, and CONSOLE_WRITE includes CONSOLE_READ. BACKUP_CREATE and BACKUP_DOWNLOAD are independent. Changes take effect immediately, including for users who are currently connected.'),
+        actions.length ? h('p', { class: 'hint' }, 'Custom actions are granted one by one and need no other permission than access to the server: a user with an action grant can run that predefined command without CONSOLE_WRITE.') : null,
         users.map((u) => {
           const status = h('span', { class: 'muted small' });
+          const warn = h('span');
           let timer = null;
-          const editor = permissionEditor(u.mask, (mask) => {
+          let mask = u.mask;
+          const granted = new Set(u.actions || []);
+          const syncWarn = () => replace(warn, granted.size && !mask ? chip('needs a server permission to use its actions', 'chip-warn') : null);
+          const editor = permissionEditor(u.mask, (next) => {
+            mask = next;
+            syncWarn();
             clearTimeout(timer);
             status.textContent = 'Saving…';
             timer = setTimeout(async () => {
               try {
-                await api.put(`/admin/users/${u.user_id}/permissions/${api.enc(id)}`, { mask });
+                await api.put(`/admin/users/${u.user_id}/permissions/${api.enc(id)}`, { mask: next });
                 status.textContent = 'Saved';
               } catch (err) {
                 status.textContent = '';
@@ -395,10 +505,30 @@ function accessTab(server) {
               }
             }, 350);
           });
+          const actionBoxes = actions.length ? h('div', { class: 'perm-actions' }, h('div', { class: 'perm-actions-title' }, 'Custom actions'),
+            h('div', { class: 'perm-grid' }, actions.map((a) => {
+              const input = h('input', { type: 'checkbox', checked: granted.has(a.id) });
+              input.addEventListener('change', async () => {
+                input.disabled = true;
+                try {
+                  await api.put(`/admin/users/${u.user_id}/actions/${api.enc(id)}/${api.enc(a.id)}`, { allowed: input.checked });
+                  if (input.checked) granted.add(a.id); else granted.delete(a.id);
+                  syncWarn();
+                  status.textContent = 'Saved';
+                } catch (err) {
+                  input.checked = !input.checked;
+                  notify.error(errorMessage(err));
+                } finally {
+                  input.disabled = false;
+                }
+              });
+              return h('label', { class: 'perm' }, input, h('span', null, h('strong', null, (a.icon ? a.icon + ' ' : '') + a.name), h('small', null, a.description || (a.method === 'tmux' ? 'Console command' : 'Script'))));
+            }))) : null;
+          syncWarn();
           return h('div', { class: 'perm-row' },
             h('div', { class: 'perm-user' }, h('strong', null, u.display_name || u.username), h('span', { class: 'muted' }, ' @' + u.username),
-              u.disabled ? chip('disabled', 'chip-bad') : null, status),
-            editor);
+              u.disabled ? chip('disabled', 'chip-bad') : null, warn, status),
+            editor, actionBoxes);
         }),
         admins.length ? h('p', { class: 'hint' }, `Administrators with full access: ${admins.map((a) => a.username).join(', ')}.`) : null);
     } catch (err) {
@@ -415,17 +545,31 @@ function accessTab(server) {
 export function serverPage(ctx) {
   const [id, tabArg] = ctx.args;
   const header = h('div', { class: 'server-header' });
+  const actionsHost = h('div');
   const tabsNav = h('div', { class: 'tabs', role: 'tablist' });
   const tabBody = h('div', { class: 'tab-body' });
-  const el = h('div', { class: 'page' }, header, tabsNav, tabBody);
+  const el = h('div', { class: 'page' }, header, actionsHost, tabsNav, tabBody);
   let tab = null;
   let tabName = '';
   let gone = false;
+  let panel = null;
+  let panelKey = '';
+
+  // The actions panel is rebuilt only when the set of visible actions
+  // changes, so status updates do not flicker it.
+  function renderActions(s) {
+    const key = (s.actions || []).map((a) => `${a.id}:${a.name}:${a.icon}:${a.disabled}:${a.confirm}`).join('|');
+    if (key === panelKey && panel) return;
+    if (panel) panel.destroy();
+    panelKey = key;
+    panel = actionsPanel(s);
+    replace(actionsHost, panel.el);
+  }
 
   function availableTabs(s) {
     const tabs = [];
     if (store.can(s, store.PERM.CONSOLE_READ)) tabs.push(['console', 'Console', consoleTab]);
-    if (store.can(s, store.PERM.BACKUPS)) tabs.push(['backups', 'Backups', backupsTab]);
+    if (store.canAny(s, store.PERM.BACKUP_CREATE | store.PERM.BACKUP_DOWNLOAD)) tabs.push(['backups', 'Backups', backupsTab]);
     tabs.push(['activity', 'Activity', activityTab]);
     if (store.can(s, store.PERM.CONFIG)) tabs.push(['settings', 'Settings', settingsTab]);
     if (store.isAdmin()) tabs.push(['access', 'Access', accessTab]);
@@ -441,7 +585,7 @@ export function serverPage(ctx) {
           h('h1', null, s.name, ' ', statusBadge(st.state)),
           h('div', { class: 'card-meta' },
             chip(BACKEND_LABEL[s.backend] || s.backend, 'chip-backend'),
-            s.category ? chip(s.category) : null,
+            s.category_name ? chip(s.category_name) : null,
             h('span', { class: 'muted small' }, `ID ${s.id} · ${st.state.toLowerCase()} since ${fmtRelative(st.since)}`),
             st.operation ? chip(`${st.operation.type} in progress`, 'chip-op') : null)),
         h('div', { class: 'server-actions' }, serverActions(s))),
@@ -459,6 +603,7 @@ export function serverPage(ctx) {
     const s = store.state.servers.get(id);
     if (!s) {
       destroyTab();
+      if (panel) { panel.destroy(); panel = null; panelKey = ''; replace(actionsHost); }
       tabName = '';
       if (!store.state.serversLoaded) { replace(header, loading()); replace(tabsNav); replace(tabBody); return; }
       replace(header, h('a', { class: 'back', href: '#/' }, '← Servers'));
@@ -469,6 +614,7 @@ export function serverPage(ctx) {
     }
     document.title = `${s.name} · Server Manager`;
     renderHeader(s);
+    renderActions(s);
     const tabs = availableTabs(s);
     const wanted = tabs.find((t) => t[0] === (tabArg || tabName)) || tabs[0];
     replace(tabsNav, tabs.map(([key, label]) => h('a', {
@@ -489,6 +635,6 @@ export function serverPage(ctx) {
   render();
   return {
     el,
-    destroy: () => { gone = true; offs.forEach((off) => off()); destroyTab(); document.title = 'Server Manager'; },
+    destroy: () => { gone = true; offs.forEach((off) => off()); destroyTab(); if (panel) panel.destroy(); document.title = 'Server Manager'; },
   };
 }

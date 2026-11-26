@@ -27,6 +27,7 @@ type identity struct {
 	User      *db.User
 	SessionID string
 	perms     map[string]perm.Mask
+	actions   map[string]map[string]bool
 }
 
 func (s *Server) ident(r *http.Request) *identity {
@@ -57,6 +58,38 @@ func (s *Server) loadPerms(r *http.Request, id *identity) (map[string]perm.Mask,
 	}
 	id.perms = out
 	return out, nil
+}
+
+// loadActionGrants returns the caller's custom action grants (cached per
+// request).
+func (s *Server) loadActionGrants(r *http.Request, id *identity) (map[string]map[string]bool, error) {
+	if id.actions != nil {
+		return id.actions, nil
+	}
+	grants, err := s.Store.ActionPermissionsForUser(r.Context(), id.User.ID)
+	if err != nil {
+		return nil, err
+	}
+	id.actions = grants
+	return grants, nil
+}
+
+// actionAllowed reports whether the caller may run a custom action:
+// administrators always; others need access to the server and an explicit
+// grant for that action. Lifecycle or console permissions never imply it.
+func (s *Server) actionAllowed(r *http.Request, id *identity, serverID, actionID string) (bool, error) {
+	if id.User.IsAdmin {
+		return true, nil
+	}
+	mask, err := s.effective(r, id, serverID)
+	if err != nil || !mask.Any() {
+		return false, err
+	}
+	grants, err := s.loadActionGrants(r, id)
+	if err != nil {
+		return false, err
+	}
+	return grants[serverID][actionID], nil
 }
 
 // effective returns the caller's effective mask for a server.

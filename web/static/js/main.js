@@ -3,7 +3,7 @@
 import * as api from './api.js';
 import * as store from './store.js';
 import { h, replace, notify, loading, errorMessage } from './ui.js';
-import { loginPage, registerPage, verifyEmailPage } from './pages/auth.js';
+import { loginPage, registerPage, verifyEmailPage, forgotPasswordPage, resetPasswordPage } from './pages/auth.js';
 import { dashboardPage } from './pages/dashboard.js';
 import { serverPage } from './pages/server.js';
 import { newServerPage } from './pages/serverform.js';
@@ -13,6 +13,7 @@ import { auditPage } from './pages/audit.js';
 import { settingsPage } from './pages/settings.js';
 import { profilePage } from './pages/profile.js';
 import { systemPage } from './pages/system.js';
+import { limitsPage } from './pages/limits.js';
 
 const app = document.getElementById('app');
 
@@ -48,6 +49,7 @@ const routes = [
   { re: /^\/admin\/servers\/new$/, page: newServerPage, nav: 'dashboard', admin: true },
   { re: /^\/admin\/users$/, page: usersPage, nav: 'users', admin: true },
   { re: /^\/admin\/invitations$/, page: invitationsPage, nav: 'invitations', admin: true },
+  { re: /^\/admin\/limits$/, page: limitsPage, nav: 'limits', admin: true },
   { re: /^\/admin\/audit$/, page: auditPage, nav: 'audit', admin: true },
   { re: /^\/admin\/settings$/, page: settingsPage, nav: 'settings', admin: true },
 ];
@@ -56,6 +58,8 @@ const publicRoutes = [
   { re: /^\/login$/, page: loginPage },
   { re: /^\/register$/, page: registerPage },
   { re: /^\/verify-email$/, page: verifyEmailPage },
+  { re: /^\/forgot-password$/, page: forgotPasswordPage },
+  { re: /^\/reset-password$/, page: resetPasswordPage },
 ];
 
 function parseHash() {
@@ -159,6 +163,7 @@ function buildShell() {
       store.isAdmin() ? [
         link('users', '#/admin/users', 'Users'),
         link('invitations', '#/admin/invitations', 'Invitations'),
+        link('limits', '#/admin/limits', 'Limits'),
         link('audit', '#/admin/audit', 'Audit log'),
         link('settings', '#/admin/settings', 'Settings'),
       ] : null,
@@ -216,12 +221,13 @@ async function enterApp() {
   store.startEvents();
   try {
     await store.loadServers();
+    store.loadCapacity();
   } catch (err) {
     notify.error(errorMessage(err));
   }
   const back = sessionStorage.getItem('sm-return');
   sessionStorage.removeItem('sm-return');
-  const target = back && !/^#\/(login|register|verify-email)/.test(back) ? back.slice(1) : '/';
+  const target = back && !/^#\/(login|register|verify-email|forgot-password|reset-password)/.test(back) ? back.slice(1) : '/';
   if (location.hash === '#' + target) render();
   else location.hash = target;
 }
@@ -235,6 +241,7 @@ async function boot() {
       await api.refresh();
       store.startEvents();
       await store.loadServers().catch(() => {});
+      store.loadCapacity();
     } catch (err) {
       // Not signed in (any more).
       if (err.status === 401 || err.status === 403) api.lostSession();
