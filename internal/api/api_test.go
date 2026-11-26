@@ -688,7 +688,7 @@ func TestPerServerPermissionsAreEnforced(t *testing.T) {
 	}
 
 	// Invalid masks and unknown targets are rejected.
-	if r := admin.do("PUT", fmt.Sprintf("/admin/users/%d/permissions/alpha", bob.ID), map[string]int{"mask": 64}); r.Status != 400 {
+	if r := admin.do("PUT", fmt.Sprintf("/admin/users/%d/permissions/alpha", bob.ID), map[string]int{"mask": 256}); r.Status != 400 {
 		t.Fatalf("undefined permission bit: %d", r.Status)
 	}
 	if r := admin.do("PUT", fmt.Sprintf("/admin/users/%d/permissions/ghost", bob.ID), map[string]int{"mask": 1}); r.Status != 404 {

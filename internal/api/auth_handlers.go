@@ -132,6 +132,9 @@ func (s *Server) features(u *db.User) map[string]any {
 		"config_full_access":  u.IsAdmin || c.Security.ConfigPermissionFullAccess,
 		"development":         c.Development(),
 		"version":             s.Version,
+		"notifications":       c.Notifications.Enabled && s.Mailer.Available(),
+		// Email password reset never applies to administrators.
+		"password_reset": !u.IsAdmin && s.passwordResetAvailable(),
 	}
 }
 
@@ -140,7 +143,11 @@ func (s *Server) mePayload(ctx context.Context, u *db.User) (map[string]any, err
 	if err != nil {
 		return nil, err
 	}
-	return map[string]any{"user": u, "permissions": perms, "features": s.features(u)}, nil
+	out := map[string]any{"user": u, "permissions": perms, "features": s.features(u), "pending_email": nil}
+	if email, expires, err := s.Store.PendingEmailChange(ctx, u.ID, time.Now()); err == nil && email != "" && !strings.EqualFold(email, u.Email) {
+		out["pending_email"] = map[string]any{"email": email, "expires_at": expires}
+	}
+	return out, nil
 }
 
 // issue creates the access token response for an established session.
@@ -387,8 +394,14 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	if req.DisplayName == "" {
 		req.DisplayName = req.Username
 	}
-	// The invitation's address (if any) was proven by receiving the link.
+	// The invitation's address is proven only when the invitation was
+	// emailed there: a link the administrator passed on by hand proves
+	// nothing about the address.
 	u := &db.User{Username: req.Username, DisplayName: req.DisplayName, Email: strings.ToLower(inv.Email), PasswordHash: pw}
+	if inv.Email != "" && inv.LastSentAt != nil {
+		now := time.Now().UTC().Truncate(time.Second)
+		u.EmailVerifiedAt = &now
+	}
 	if err := s.Store.RegisterWithInvitation(r.Context(), hash, u, time.Now()); err != nil {
 		switch {
 		case errors.Is(err, db.ErrInvitationInvalid):
@@ -579,6 +592,10 @@ func (s *Server) handleRequestEmailChange(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if strings.EqualFold(email, id.User.Email) {
+		if !id.User.EmailVerified {
+			s.fail(w, r, badRequest("That is already your email address. Use \"Send verification email\" to verify it."))
+			return
+		}
 		s.fail(w, r, badRequest("That is already your email address."))
 		return
 	}

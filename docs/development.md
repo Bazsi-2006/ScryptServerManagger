@@ -93,6 +93,9 @@ make test-race
 | Command argument handling, environment scrubbing, readiness checks | `internal/backend` | |
 | Custom backend | `internal/backend` | starts real shell scripts: stdin, PTY, signals, re-adoption |
 | Lifecycle, concurrency, timeouts, restart recovery | `internal/manager` | real processes |
+| Concurrency limits (atomic reservation, external starts, restart), transition classification, tmux backups, custom actions | `internal/manager` | real processes; tmux parts need the `tmux` binary |
+| Notification recipients, dedupe, cooldown, retries | `internal/notify` | real SQLite, fake mailer |
+| Upgrade from schema version 2, password resets, action grants, notification storage | `internal/db` | real SQLite files |
 | Full API: auth flow, invitations, per-server authorization, SSE, backups, settings | `internal/api` | complete application over HTTP |
 | Embedded frontend serving, CLI bootstrap | `internal/app`, `cmd/server-manager` | |
 

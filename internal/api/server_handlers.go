@@ -6,6 +6,7 @@ import (
 	"mime"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,21 +23,68 @@ import (
 // no paths, commands or environment: those are only available through the
 // configuration endpoint, which requires CONFIG.
 type serverView struct {
-	ID           string               `json:"id"`
-	Name         string               `json:"name"`
-	Description  string               `json:"description"`
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	// Category is the definition's raw value; CategoryID is set when it
+	// refers to a managed category, CategoryName is what to display.
 	Category     string               `json:"category"`
+	CategoryID   string               `json:"category_id"`
+	CategoryName string               `json:"category_name"`
 	Backend      string               `json:"backend"`
 	Status       manager.Status       `json:"status"`
 	Capabilities manager.Capabilities `json:"capabilities"`
 	Permissions  int                  `json:"permissions"`
+	// Actions are the custom actions the caller may run (administrators:
+	// all of them, disabled ones flagged). Never includes what they execute.
+	Actions []actionView `json:"actions"`
 }
 
-func (s *Server) view(def *servers.Definition, mask perm.Mask) serverView {
+// actionView is the public description of a custom action.
+type actionView struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	Icon        string `json:"icon,omitempty"`
+	Method      string `json:"method"`
+	Confirm     bool   `json:"confirm"`
+	Disabled    bool   `json:"disabled,omitempty"`
+}
+
+// visibleActions lists the actions of def the caller may run.
+func (s *Server) visibleActions(r *http.Request, id *identity, def *servers.Definition, mask perm.Mask) []actionView {
+	out := []actionView{}
+	var grants map[string]bool
+	if !id.User.IsAdmin {
+		if !mask.Any() {
+			return out
+		}
+		all, err := s.loadActionGrants(r, id)
+		if err != nil {
+			return out
+		}
+		grants = all[def.ID]
+	}
+	for _, a := range def.Actions {
+		if !id.User.IsAdmin && (a.Disabled || !grants[a.ID]) {
+			continue
+		}
+		out = append(out, actionView{ID: a.ID, Name: a.Name, Description: a.Description, Icon: a.Icon, Method: a.Method, Confirm: a.Confirm, Disabled: a.Disabled})
+	}
+	return out
+}
+
+func (s *Server) view(r *http.Request, def *servers.Definition, mask perm.Mask) serverView {
 	st, _ := s.Manager.Status(def.ID)
 	caps, _ := s.Manager.Capabilities(def.ID)
-	return serverView{ID: def.ID, Name: def.Name, Description: def.Description, Category: def.Category, Backend: def.Backend,
-		Status: st, Capabilities: caps, Permissions: int(mask)}
+	c := s.Config.Get()
+	v := serverView{ID: def.ID, Name: def.Name, Description: def.Description, Category: def.Category, CategoryName: c.CategoryLabel(def.Category),
+		Backend: def.Backend, Status: st, Capabilities: caps, Permissions: int(mask)}
+	if cat, ok := c.ResolveCategory(def.Category); ok {
+		v.CategoryID = cat.ID
+	}
+	v.Actions = s.visibleActions(r, s.ident(r), def, mask)
+	return v
 }
 
 // access resolves a server for the caller and checks one permission.
@@ -45,6 +93,15 @@ func (s *Server) view(def *servers.Definition, mask perm.Mask) serverView {
 // it did not exist, so server IDs cannot be probed. A caller who can see
 // the server but lacks the specific permission gets 403.
 func (s *Server) access(w http.ResponseWriter, r *http.Request, need perm.Mask, auditAction string) (*servers.Definition, perm.Mask, bool) {
+	return s.accessCheck(w, r, need, false, auditAction)
+}
+
+// accessAny is access satisfied by any one of the flags in need.
+func (s *Server) accessAny(w http.ResponseWriter, r *http.Request, need perm.Mask, auditAction string) (*servers.Definition, perm.Mask, bool) {
+	return s.accessCheck(w, r, need, true, auditAction)
+}
+
+func (s *Server) accessCheck(w http.ResponseWriter, r *http.Request, need perm.Mask, anyOf bool, auditAction string) (*servers.Definition, perm.Mask, bool) {
 	id := s.ident(r)
 	serverID := r.PathValue("id")
 	def, err := s.Manager.Definition(serverID)
@@ -61,12 +118,20 @@ func (s *Server) access(w http.ResponseWriter, r *http.Request, need perm.Mask, 
 		s.fail(w, r, errNotFound)
 		return nil, 0, false
 	}
-	if need != 0 && !mask.Has(need) {
+	granted := mask.Has(need)
+	if anyOf {
+		granted = mask.HasAny(need)
+	}
+	if need != 0 && !granted {
+		names := need.String()
+		if anyOf {
+			names = strings.ReplaceAll(names, "|", " or ")
+		}
 		if auditAction != "" {
-			s.Audit.Record(s.actor(r), serverID, auditAction, audit.Denied, map[string]any{"required": need.String()})
+			s.Audit.Record(s.actor(r), serverID, auditAction, audit.Denied, map[string]any{"required": names})
 		}
 		s.fail(w, r, &apiError{Status: http.StatusForbidden, Code: "permission_denied",
-			Message: "You do not have the " + need.String() + " permission for this server."})
+			Message: "You do not have the " + names + " permission for this server."})
 		return nil, 0, false
 	}
 	return def, mask, true
@@ -84,7 +149,7 @@ func (s *Server) handleListServers(w http.ResponseWriter, r *http.Request) {
 		if !mask.Any() {
 			continue
 		}
-		out = append(out, s.view(def, mask))
+		out = append(out, s.view(r, def, mask))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"servers": out})
 }
@@ -94,7 +159,7 @@ func (s *Server) handleGetServer(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"server": s.view(def, mask)})
+	writeJSON(w, http.StatusOK, map[string]any{"server": s.view(r, def, mask)})
 }
 
 func (s *Server) handleCreateServer(w http.ResponseWriter, r *http.Request) {
@@ -113,8 +178,9 @@ func (s *Server) handleCreateServer(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	s.Audit.Record(s.actor(r), saved.ID, audit.ServerCreate, audit.Success, map[string]any{"backend": saved.Backend, "name": saved.Name})
-	writeJSON(w, http.StatusCreated, map[string]any{"server": s.view(saved, perm.All), "config": saved})
+	s.Audit.Record(s.actor(r), saved.ID, audit.ServerCreate, audit.Success, map[string]any{"backend": saved.Backend, "name": saved.Name, "actions": len(saved.Actions)})
+	s.Manager.NotifyCapacityChanged()
+	writeJSON(w, http.StatusCreated, map[string]any{"server": s.view(r, saved, perm.All), "config": saved})
 }
 
 // fullConfigAccess reports whether the caller may edit execution settings.
@@ -133,9 +199,9 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 		scope = "full"
 	}
 	if !id.User.IsAdmin {
-		// Environment values may hold credentials; only administrators
-		// read them back.
-		def = def.MaskEnv()
+		// Environment values may hold credentials, and custom actions are
+		// managed by administrators only: neither is shown to others.
+		def = def.MaskEnv().WithoutActions()
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"config": def, "edit_scope": scope})
 }
@@ -156,12 +222,24 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	def.ID = old.ID
 	def.RestoreMaskedEnv(old)
+	id := s.ident(r)
+	if !id.User.IsAdmin {
+		// Non-administrators never see the custom actions, so whatever
+		// they send cannot change them.
+		def.Actions = old.Clone().Actions
+	}
 	def.Normalize()
 	if err := def.Validate(); err != nil {
 		s.fail(w, r, err)
 		return
 	}
-	id := s.ident(r)
+	if !id.User.IsAdmin && strings.TrimSpace(old.Category) != def.Category {
+		// The category decides which concurrency limit applies.
+		s.Audit.Record(s.actor(r), old.ID, audit.ServerUpdate, audit.Denied, map[string]any{"reason": "category changes require an administrator"})
+		s.fail(w, r, &apiError{Status: http.StatusForbidden, Code: "permission_denied",
+			Message: "Only administrators can change a server's category, because it decides which concurrency limit applies."})
+		return
+	}
 	if !s.fullConfigAccess(id) && !servers.ExecutionEqual(old, &def) {
 		// Holders of CONFIG may tune presentation, timeouts and the console
 		// readiness pattern, but not anything that decides what is executed
@@ -183,9 +261,16 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	s.Audit.Record(s.actor(r), saved.ID, audit.ServerUpdate, audit.Success, map[string]any{"execution_changed": !servers.ExecutionEqual(old, saved)})
 	out := saved
 	if !id.User.IsAdmin {
-		out = saved.MaskEnv()
+		out = saved.MaskEnv().WithoutActions()
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"server": s.view(saved, mask), "config": out})
+	if old.Category != saved.Category {
+		s.Manager.NotifyCapacityChanged()
+	}
+	if len(old.Actions) != len(saved.Actions) || !servers.ExecutionEqual(old, saved) {
+		// Removed actions lose their grants; refresh live identities.
+		s.Hub.Revalidate()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"server": s.view(r, saved, mask), "config": out})
 }
 
 func (s *Server) handleDeleteServer(w http.ResponseWriter, r *http.Request) {
@@ -223,17 +308,39 @@ func (s *Server) operate(action string, need perm.Mask, auditAction string) hand
 				return
 			}
 		}
+		var req struct {
+			// OverrideLimits starts the server although a concurrency
+			// limit is reached (administrators only; audited).
+			OverrideLimits bool `json:"override_limits"`
+		}
+		if r.ContentLength != 0 && action != manager.OpStop {
+			if err := s.decode(w, r, &req); err != nil {
+				s.fail(w, r, err)
+				return
+			}
+		}
+		if req.OverrideLimits && !s.ident(r).User.IsAdmin {
+			s.Audit.Record(s.actor(r), def.ID, auditAction, audit.Denied, map[string]any{"reason": "limit override requires an administrator"})
+			s.fail(w, r, &apiError{Status: http.StatusForbidden, Code: "permission_denied", Message: "Only administrators can override the concurrency limits."})
+			return
+		}
+		opts := manager.StartOptions{OverrideLimits: req.OverrideLimits}
 		var op *manager.OpInfo
 		var err error
 		switch action {
 		case manager.OpStart:
-			op, err = s.Manager.StartServer(def.ID, s.actor(r))
+			op, err = s.Manager.StartServerWith(def.ID, s.actor(r), opts)
 		case manager.OpStop:
 			op, err = s.Manager.StopServer(def.ID, s.actor(r))
 		case manager.OpRestart:
-			op, err = s.Manager.RestartServer(def.ID, s.actor(r))
+			op, err = s.Manager.RestartServerWith(def.ID, s.actor(r), opts)
 		}
 		if err != nil {
+			var le *manager.LimitError
+			if errors.As(err, &le) {
+				s.Audit.Record(s.actor(r), def.ID, auditAction, audit.Denied, map[string]any{
+					"reason": "concurrency limit", "scope": le.Scope, "category": le.CategoryName, "limit": le.Limit, "in_use": le.InUse})
+			}
 			s.failOp(w, r, err)
 			return
 		}
@@ -353,17 +460,26 @@ func (s *Server) canDeleteBackups(id *identity, def *servers.Definition) bool {
 	return id.User.IsAdmin || (def.Backup != nil && def.Backup.AllowUserDelete)
 }
 
+// handleListBackups serves the backups tab. Either backup permission opens
+// it; only BACKUP_DOWNLOAD reveals the files, only BACKUP_CREATE allows
+// starting a backup.
 func (s *Server) handleListBackups(w http.ResponseWriter, r *http.Request) {
-	def, _, ok := s.access(w, r, perm.Backups, "")
+	def, mask, ok := s.accessAny(w, r, perm.AnyBackup, "")
 	if !ok {
 		return
 	}
 	caps, _ := s.Manager.Capabilities(def.ID)
 	st, _ := s.Manager.Status(def.ID)
-	out := map[string]any{"files": []backup.File{}, "configured": caps.Backups, "can_create": caps.BackupCreate,
-		"can_delete": s.canDeleteBackups(s.ident(r), def), "operation": nil}
+	canList := mask.Has(perm.BackupDownload)
+	out := map[string]any{"files": []backup.File{}, "configured": caps.Backups, "can_list": canList,
+		"can_create": caps.BackupCreate && mask.Has(perm.BackupCreate), "create_supported": caps.BackupCreate,
+		"method": caps.BackupMethod, "can_delete": canList && s.canDeleteBackups(s.ident(r), def), "operation": nil}
 	if st.Operation != nil && st.Operation.Type == manager.OpBackup {
 		out["operation"] = st.Operation
+	}
+	if !canList {
+		writeJSON(w, http.StatusOK, out)
+		return
 	}
 	if caps.Backups {
 		files, err := backup.List(def.Backup.Directory)
@@ -381,7 +497,7 @@ func (s *Server) handleListBackups(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCreateBackup(w http.ResponseWriter, r *http.Request) {
-	def, _, ok := s.access(w, r, perm.Backups, audit.BackupCreate)
+	def, _, ok := s.access(w, r, perm.BackupCreate, audit.BackupCreate)
 	if !ok {
 		return
 	}
@@ -397,7 +513,7 @@ func (s *Server) handleCreateBackup(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCancelBackup(w http.ResponseWriter, r *http.Request) {
-	def, _, ok := s.access(w, r, perm.Backups, audit.BackupCancel)
+	def, _, ok := s.access(w, r, perm.BackupCreate, audit.BackupCancel)
 	if !ok {
 		return
 	}
@@ -414,7 +530,7 @@ func (s *Server) handleCancelBackup(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteBackup(w http.ResponseWriter, r *http.Request) {
-	def, _, ok := s.access(w, r, perm.Backups, audit.BackupDelete)
+	def, _, ok := s.access(w, r, perm.BackupDownload, audit.BackupDelete)
 	if !ok {
 		return
 	}
@@ -488,7 +604,7 @@ func (t *ticketStore) take(id string) (ticket, bool) {
 }
 
 func (s *Server) handleDownloadTicket(w http.ResponseWriter, r *http.Request) {
-	def, _, ok := s.access(w, r, perm.Backups, audit.BackupDownload)
+	def, _, ok := s.access(w, r, perm.BackupDownload, audit.BackupDownload)
 	if !ok {
 		return
 	}
@@ -570,7 +686,8 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"name": "Server Manager", "version": s.Version, "registration": "invitation"})
+	writeJSON(w, http.StatusOK, map[string]any{"name": "Server Manager", "version": s.Version, "registration": "invitation",
+		"password_reset": s.passwordResetAvailable()})
 }
 
 func (s *Server) handleOpenAPI(w http.ResponseWriter, r *http.Request) {

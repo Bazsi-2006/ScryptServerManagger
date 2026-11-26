@@ -56,12 +56,26 @@ type server struct {
 	// only a verifiable check (port/script) may promote it to RUNNING;
 	// console/none readiness cannot be re-evaluated and must not be assumed.
 	unready bool
+
+	// occupied: the server holds a concurrency slot (see capacity.go).
+	occupied bool
+	// probed is set after the first completed observation; firstProbe is
+	// closed at the same moment.
+	probed     bool
+	firstProbe chan struct{}
+	// lastKnown is the last state other than UNKNOWN.
+	lastKnown State
+	// actions holds the custom actions currently running, by action ID.
+	actions map[string]*runningAction
+	// stopWatch ends the backup directory watcher, if one runs.
+	stopWatch context.CancelFunc
 }
 
 func newServer(m *Manager, def *servers.Definition) *server {
 	ctx, cancel := context.WithCancel(m.ctx)
 	s := &server{m: m, id: def.ID, buf: m.newBuffer(), wake: make(chan struct{}, 1), ctx: ctx, cancel: cancel,
-		def: def, state: Unknown, message: "checking current state", since: time.Now()}
+		def: def, state: Unknown, message: "checking current state", since: time.Now(),
+		firstProbe: make(chan struct{}), actions: map[string]*runningAction{}}
 	s.be = s.newBackend(def)
 	return s
 }
@@ -128,6 +142,10 @@ func (s *server) shutdown() {
 	if f := s.follow; f != nil && f.cancel != nil {
 		f.cancel()
 	}
+	if s.stopWatch != nil {
+		s.stopWatch()
+		s.stopWatch = nil
+	}
 	be := s.be
 	s.mu.Unlock()
 	s.buf.CloseAll()
@@ -161,7 +179,18 @@ func (s *server) publishStatusLocked() {
 }
 
 // setLocked updates the state and notifies subscribers if anything changed.
+// Active states take a concurrency slot; only STOPPED (a confirmed stop)
+// releases it. ERROR and UNKNOWN leave occupancy as it was.
 func (s *server) setLocked(state State, message string) {
+	switch {
+	case isActive(state):
+		s.setOccupiedLocked(true)
+	case state == Stopped:
+		s.setOccupiedLocked(false)
+	}
+	if state != Unknown {
+		s.lastKnown = state
+	}
 	if s.state == state && s.message == message {
 		return
 	}
@@ -310,18 +339,28 @@ func (s *server) observe() {
 	if s.be != be || s.deleted || (s.op != nil && s.op.info.Type != OpBackup) {
 		return // superseded while probing
 	}
+	defer s.markProbedLocked()
+	prev, prevKnown := s.state, s.lastKnown
 	switch l {
 	case lifeUnknown:
+		// Inconclusive: neither the state nor the concurrency slot changes
+		// meaning; the last conclusive observation stands.
 		s.setLocked(Unknown, detail)
 	case lifeDead:
 		s.unready = false
+		s.setOccupiedLocked(false)
+		failed := p.Phase == backend.PhaseFailed
+		lostWhileUp := prev == Unknown && s.probed && (prevKnown == Running || prevKnown == Starting)
 		switch {
-		case p.Phase == backend.PhaseFailed && s.state != Stopped && s.state != Error:
+		case failed && prev != Stopped && prev != Error:
 			s.setLocked(Error, firstNonEmpty(detail, "the server failed"))
-		case s.state == Error || s.state == Stopped:
+		case prev == Error || prev == Stopped:
 			// Keep the message that explains how we got here.
-		case s.state == Running || s.state == Starting || s.state == Stopping:
+		case prev == Running || prev == Starting || prev == Stopping || lostWhileUp:
 			msg := "the server stopped outside of the manager"
+			if lostWhileUp {
+				msg = "the server stopped while its state could not be monitored"
+			}
 			if detail != "" {
 				msg += " (" + detail + ")"
 			}
@@ -329,7 +368,10 @@ func (s *server) observe() {
 		default:
 			s.setLocked(Stopped, "")
 		}
+		s.observedTransitionLocked(prev, prevKnown, s.state, failed, detail)
 	case lifeAlive:
+		s.setOccupiedLocked(true)
+		defer func() { s.observedTransitionLocked(prev, prevKnown, s.state, false, detail) }()
 		switch {
 		case p.Phase == backend.PhaseStopping:
 			s.setLocked(Stopping, detail)
@@ -348,6 +390,14 @@ func (s *server) observe() {
 		default:
 			s.setLocked(Starting, firstNonEmpty(readyDetail, "waiting for the readiness check to pass"))
 		}
+	}
+}
+
+// markProbedLocked records that the server's real state is known.
+func (s *server) markProbedLocked() {
+	if !s.probed {
+		s.probed = true
+		close(s.firstProbe)
 	}
 }
 

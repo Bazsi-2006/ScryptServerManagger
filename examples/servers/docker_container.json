@@ -2,7 +2,7 @@
   "id": "docker_container",
   "name": "Minecraft (Docker)",
   "description": "An existing container. State and logs come from the Docker Engine API; console commands run a fixed helper inside the container.",
-  "category": "Minecraft",
+  "category": "minecraft",
   "backend": "docker",
   "docker": {
     "container": "minecraft",

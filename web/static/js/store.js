@@ -8,16 +8,28 @@ import * as api from './api.js';
 import { openStream } from './sse.js';
 import { notify } from './ui.js';
 
-export const PERM = { START: 1, STOP: 2, CONSOLE_READ: 4, CONSOLE_WRITE: 8, BACKUPS: 16, CONFIG: 32 };
+// Bit 16 was the former general BACKUPS permission; it was split into
+// BACKUP_CREATE and BACKUP_DOWNLOAD and is still read as both.
+export const PERM = { START: 1, STOP: 2, CONSOLE_READ: 4, CONSOLE_WRITE: 8, CONFIG: 32, BACKUP_CREATE: 64, BACKUP_DOWNLOAD: 128 };
+const LEGACY_BACKUPS = 16;
+const ALL = 1 | 2 | 4 | 8 | 32 | 64 | 128;
 export const PERM_LIST = [
   ['START', 1, 'Start the server'], ['STOP', 2, 'Stop and restart (includes Start)'],
   ['CONSOLE_READ', 4, 'View console output'], ['CONSOLE_WRITE', 8, 'Send console commands (includes Read)'],
-  ['BACKUPS', 16, 'Create and download backups'], ['CONFIG', 32, 'Edit server settings'],
+  ['BACKUP_CREATE', 64, 'Start backups'], ['BACKUP_DOWNLOAD', 128, 'View and download backup files'],
+  ['CONFIG', 32, 'Edit server settings'],
 ];
+
+/** Normalize a stored mask (expands the legacy BACKUPS bit). */
+export function normalize(mask) {
+  let m = mask || 0;
+  if (m & LEGACY_BACKUPS) m |= PERM.BACKUP_CREATE | PERM.BACKUP_DOWNLOAD;
+  return m & ALL;
+}
 
 /** Apply the implications: STOP grants START, CONSOLE_WRITE grants CONSOLE_READ. */
 export function effective(mask) {
-  let m = mask & 63;
+  let m = normalize(mask);
   if (m & PERM.STOP) m |= PERM.START;
   if (m & PERM.CONSOLE_WRITE) m |= PERM.CONSOLE_READ;
   return m;
@@ -31,6 +43,7 @@ export const state = {
   servers: new Map(),
   serversLoaded: false,
   metrics: { latest: null, history: [] },
+  capacity: null,
   live: false,
 };
 
@@ -56,12 +69,19 @@ export function can(server, flag) {
   return (server.permissions & flag) === flag;
 }
 
+/** True when the caller holds any of the flags. */
+export function canAny(server, flags) {
+  if (!server) return false;
+  return (server.permissions & flags) !== 0;
+}
+
 export function isAdmin() { return !!(state.user && state.user.is_admin); }
 
 export function setSession(payload) {
   state.user = payload.user;
   state.features = payload.features || {};
   state.permissions = payload.permissions || {};
+  state.pendingEmail = payload.pending_email || null;
   if (payload.session_id) state.sessionId = payload.session_id;
   emit('me');
 }
@@ -73,6 +93,24 @@ export function clearSession() {
   state.servers = new Map();
   state.serversLoaded = false;
   state.metrics = { latest: null, history: [] };
+  state.capacity = null;
+}
+
+// ---- concurrency usage ----
+
+let capTimer = 0;
+export async function loadCapacity() {
+  try {
+    state.capacity = await api.get('/capacity');
+    emit('capacity');
+  } catch (err) {
+    console.warn('capacity refresh failed', err);
+  }
+}
+/** Coalesce bursts of capacity.changed events into one request. */
+function refreshCapacitySoon() {
+  clearTimeout(capTimer);
+  capTimer = setTimeout(loadCapacity, 250);
 }
 
 export async function loadMe() {
@@ -100,7 +138,7 @@ async function reloadServer(id) {
 
 export function sortedServers() {
   return [...state.servers.values()].sort((a, b) =>
-    (a.category || '').localeCompare(b.category || '', undefined, { sensitivity: 'base' }) ||
+    (a.category_name || '').localeCompare(b.category_name || '', undefined, { sensitivity: 'base' }) ||
     a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
 }
 
@@ -118,7 +156,7 @@ function setLive(v) {
 
 async function resync() {
   try {
-    await Promise.all([loadMe(), loadServers()]);
+    await Promise.all([loadMe(), loadServers(), loadCapacity()]);
     emit('resync');
   } catch (err) {
     console.warn('resync failed', err);
@@ -170,6 +208,9 @@ function handle(type, data) {
       const what = { start: 'Start', stop: 'Stop', restart: 'Restart', backup: 'Backup' }[data.operation?.type] || 'Operation';
       if (data.status === 'succeeded') {
         if (mine) notify.ok(`${name}: ${what.toLowerCase()} completed${data.message && data.operation.type !== 'backup' ? ' – ' + data.message : ''}.`);
+      } else if (data.status === 'submitted') {
+        // Delivered to the server console; completion cannot be verified.
+        if (mine) notify.info(`${name}: backup command sent. New backup files appear in the list when the server writes them.`);
       } else if (data.status === 'failed') {
         notify.error(`${name}: ${what.toLowerCase()} failed – ${data.message || 'unknown error'}`);
       } else if (mine && data.status === 'cancelled' && data.operation.type === 'backup') {
@@ -179,6 +220,29 @@ function handle(type, data) {
     }
     case 'server.backups.changed':
       emit('backups:' + data.server_id);
+      break;
+    case 'server.action.started':
+      emit('action:' + data.server_id, { phase: 'started', ...data });
+      break;
+    case 'server.action.completed': {
+      emit('action:' + data.server_id, { phase: 'finished', ...data });
+      const mine = state.user && data.run && data.run.user === state.user.username;
+      if (mine) {
+        const label = data.action_name || data.action_id;
+        if (data.status === 'succeeded') notify.ok(`${label}: completed.`);
+        else if (data.status === 'submitted') notify.info(`${label}: command sent to the server console.`);
+        else notify.error(`${label}: ${data.message || data.status}`);
+      }
+      break;
+    }
+    case 'capacity.changed':
+      refreshCapacitySoon();
+      break;
+    case 'categories.changed':
+      // Category names and limits changed: server labels and usage follow.
+      loadServers().catch(() => {});
+      refreshCapacitySoon();
+      emit('categories.changed');
       break;
     case 'permissions.changed':
     case 'profile.changed':

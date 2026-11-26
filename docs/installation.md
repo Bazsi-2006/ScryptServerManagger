@@ -194,9 +194,26 @@ on localhost). Use **Settings → Send a test email** to verify.
 3. `sudo systemctl restart server-manager`.
 
 Database migrations are embedded in the executable and applied automatically
-on start (each in its own transaction). An older executable refuses to open a
-database created by a newer one rather than risk damaging it. To apply
-migrations without starting the server: `server-manager migrate`.
+on start (each in its own transaction, recorded so it never runs twice). An
+older executable refuses to open a database created by a newer one rather
+than risk damaging it. To apply migrations without starting the server:
+`server-manager migrate`. **Back up the database before upgrading** (see
+below) so you can go back to the previous executable if needed.
+
+Upgrading from a release before custom actions and concurrency limits
+(schema version 2) needs no manual steps:
+
+- users, sessions, permissions, server definitions and `config.json` are
+  kept; new configuration sections take their defaults (no limits,
+  notifications allowed but off for every user until they opt in);
+- the former BACKUPS permission (16) becomes BACKUP_CREATE + BACKUP_DOWNLOAD
+  (64 + 128) for everyone who had it;
+- email addresses of accounts created from an emailed invitation are marked
+  verified; other users verify their address once from their profile before
+  they can receive notifications or (regular users) password reset links;
+- category names already used in server definitions keep working and appear
+  as *unmanaged* on the new **Limits** page, where they can be turned into
+  managed categories with a limit.
 
 Running servers are not interrupted by the restart (see `KillMode` above).
 
@@ -206,7 +223,8 @@ Everything the application owns is in three places:
 
 - `/etc/server-manager/` — configuration and server definitions,
 - `/var/lib/server-manager/server-manager.db` (plus `-wal`/`-shm` while
-  running) — users, sessions, permissions, audit log,
+  running) — users, sessions, permissions, action grants, notification
+  preferences, audit log,
 - `/var/lib/server-manager/secrets/jwt.key` — the signing key.
 
 Copy them while the service is stopped, or use `sqlite3 server-manager.db

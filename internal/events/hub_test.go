@@ -31,7 +31,7 @@ func newWorld() (*world, *Hub) {
 	w := &world{users: map[int64]Identity{
 		1: {UserID: 1, IsAdmin: true},
 		2: {UserID: 2, Perms: map[string]perm.Mask{"mc": perm.Start}},
-		3: {UserID: 3, Perms: map[string]perm.Mask{"web": perm.ConsoleRead | perm.Backups}},
+		3: {UserID: 3, Perms: map[string]perm.Mask{"web": perm.ConsoleRead | perm.BackupDownload}},
 	}, revoked: map[string]bool{}}
 	return w, New(w.resolve, func() bool { w.mu.Lock(); defer w.mu.Unlock(); return w.metrics })
 }
@@ -78,11 +78,11 @@ func TestServerEventsOnlyReachAuthorizedSubscribers(t *testing.T) {
 	none(t, webUser, "user without access to mc")
 
 	// A specific permission requirement narrows the audience further.
-	h.Publish(Event{Type: "server.backups.changed", Audience: AudienceServer, ServerID: "web", Perm: perm.Backups})
+	h.Publish(Event{Type: "server.backups.changed", Audience: AudienceServer, ServerID: "web", Perm: perm.BackupDownload})
 	recv(t, admin)
 	recv(t, webUser)
 	none(t, mcUser, "no access to web")
-	h.Publish(Event{Type: "server.backups.changed", Audience: AudienceServer, ServerID: "mc", Perm: perm.Backups})
+	h.Publish(Event{Type: "server.backups.changed", Audience: AudienceServer, ServerID: "mc", Perm: perm.BackupDownload})
 	recv(t, admin)
 	none(t, mcUser, "START does not include BACKUPS")
 

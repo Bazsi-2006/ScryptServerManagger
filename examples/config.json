@@ -19,6 +19,7 @@
     "refresh_token_ttl": "720h0m0s",
     "invitation_ttl": "72h0m0s",
     "email_change_ttl": "24h0m0s",
+    "password_reset_ttl": "1h0m0s",
     "min_password_length": 10,
     "cookie_secure": "auto",
     "jwt_secret_file": "/var/lib/server-manager/secrets/jwt.key",
@@ -68,6 +69,14 @@
       "requests": 3,
       "window": "5m0s"
     },
+    "action_run": {
+      "requests": 20,
+      "window": "1m0s"
+    },
+    "password_reset": {
+      "requests": 5,
+      "window": "15m0s"
+    },
     "server_cooldown": "3s"
   },
   "monitoring": {
@@ -104,5 +113,30 @@
     "journalctl": "journalctl",
     "sudo": "sudo",
     "docker_socket": "/var/run/docker.sock"
+  },
+  "limits": {
+    "max_concurrent_servers": 5
+  },
+  "categories": [
+    {
+      "id": "minecraft",
+      "name": "Minecraft",
+      "description": "Java edition servers",
+      "max_concurrent": 2
+    },
+    {
+      "id": "source",
+      "name": "Source Engine",
+      "max_concurrent": 3
+    },
+    {
+      "id": "other",
+      "name": "Other Games",
+      "max_concurrent": 1
+    }
+  ],
+  "notifications": {
+    "enabled": true,
+    "cooldown": "10m0s"
   }
 }

@@ -69,11 +69,15 @@ type fixture struct {
 	rec   *recorder
 	m     *Manager
 	dir   string
+	hook  func(Transition)
 }
 
-func newFixture(t *testing.T) *fixture {
+func newFixture(t *testing.T) *fixture { return newFixtureHook(t, nil) }
+
+// newFixtureHook creates a fixture whose managers report transitions to hook.
+func newFixtureHook(t *testing.T, hook func(Transition)) *fixture {
 	t.Helper()
-	f := &fixture{t: t, cfg: testutil.Config(t), rec: &recorder{}, dir: t.TempDir()}
+	f := &fixture{t: t, cfg: testutil.Config(t), rec: &recorder{}, dir: t.TempDir(), hook: hook}
 	var err error
 	f.store, err = db.Open(f.cfg.Get().Paths.Database)
 	if err != nil {
@@ -95,6 +99,9 @@ func newFixture(t *testing.T) *fixture {
 
 func (f *fixture) boot() {
 	f.m = New(f.cfg, f.defs, f.store, f.rec, audit.NewRecorder(f.store, logging.Discard()), logging.Discard())
+	if f.hook != nil {
+		f.m.SetTransitionHook(f.hook)
+	}
 	f.m.Load()
 }
 

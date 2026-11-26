@@ -17,6 +17,7 @@ const SECTIONS = [
     ['auth.refresh_token_ttl', 'Session lifetime without activity', 'text', 'e.g. 720h'],
     ['auth.invitation_ttl', 'Default invitation validity', 'text', 'e.g. 72h'],
     ['auth.email_change_ttl', 'Email verification link validity', 'text', 'e.g. 24h'],
+    ['auth.password_reset_ttl', 'Password reset link validity', 'text', 'e.g. 1h. Email password reset is only offered to regular accounts with a verified address, never to administrators.'],
     ['auth.min_password_length', 'Minimum password length', 'number'],
     ['auth.cookie_secure', 'Secure cookie flag', 'select:auto|always|never', '"auto" marks the cookie Secure whenever the site is served over HTTPS.'],
   ]],
@@ -35,12 +36,18 @@ const SECTIONS = [
     ['rate_limits.server_stop', 'Server stops (per user and server)', 'rate'],
     ['rate_limits.console_command', 'Console commands (per user and server)', 'rate'],
     ['rate_limits.backup_create', 'Backup requests (per user and server)', 'rate'],
+    ['rate_limits.action_run', 'Custom action runs (per user and server)', 'rate'],
+    ['rate_limits.password_reset', 'Password reset and verification emails (per address and per email)', 'rate'],
     ['rate_limits.server_cooldown', 'Cooldown between operations on one server', 'text', 'e.g. 3s; 0s disables it.'],
   ]],
   ['Monitoring', null, [
     ['monitoring.host_metrics_interval', 'Host metrics interval', 'text', 'e.g. 5s'],
     ['monitoring.status_poll_interval', 'Server status check interval', 'text', 'e.g. 5s'],
     ['monitoring.host_metrics_for_users', 'Show host CPU and memory to all signed-in users', 'bool'],
+  ]],
+  ['Notifications', 'Optional emails about server activity. Users opt in individually in their profile; only verified addresses receive them. Concurrency limits are managed on the Limits page.', [
+    ['notifications.enabled', 'Allow server activity notifications', 'bool'],
+    ['notifications.cooldown', 'Cooldown per server and event type', 'text', 'e.g. 10m. Repeated events of the same kind (a server that keeps crashing) are not mailed again within this time; 0s disables the cooldown.'],
   ]],
   ['Console', 'Buffer sizes apply to servers when they are next (re)loaded.', [
     ['console.buffer_lines', 'Lines kept in memory per server', 'number'],

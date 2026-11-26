@@ -24,8 +24,9 @@ link to share by hand.
 
 ### Managing accounts (**Users**)
 
-- **Edit** — display name, email address (set directly, without
-  verification), administrator role, disabled.
+- **Edit** — display name, email address, administrator role, disabled. An
+  address you set is **unverified**: the user verifies it from their profile
+  before it is used for notifications or password resets.
 - **Disabled** accounts cannot sign in and are signed out everywhere at once;
   their open pages stop receiving updates immediately.
 - **Sessions** — see where an account is signed in and revoke sessions.
@@ -33,16 +34,47 @@ link to share by hand.
   Audit entries are kept.
 
 Safeguards: you cannot remove your own administrator role, disable or delete
-yourself, and the last active administrator cannot be removed. Locked out
-anyway? On the host:
+yourself, and the last active administrator cannot be removed.
+
+### Forgotten passwords
+
+Regular users with a **verified** email address can use **Forgot password?**
+on the sign-in page (when email delivery is configured). They receive a
+single-use link that expires after `auth.password_reset_ttl` (1 hour by
+default); setting a new password signs them out everywhere. The page answers
+the same way whatever address is entered, so it cannot be used to find out
+which addresses have accounts.
+
+**Administrator accounts can never reset their password by email** — not
+even if they have a verified address, and a link issued before someone was
+made an administrator stops working. An administrator who is locked out
+resets the password on the host, which requires local access:
 
 ```bash
 sudo -u server-manager server-manager user set-password --username alice
 ```
 
+That command works for any account, revokes its sessions and invalidates
+pending reset links. If no administrator can sign in at all, create a new one:
+
 ```bash
 sudo -u server-manager server-manager admin create --username rescue
 ```
+
+### Email addresses
+
+Addresses are used for invitations, notifications and (regular accounts)
+password reset. Only **verified** addresses receive notifications and reset
+links. A user verifies an address by opening an emailed, single-use link:
+
+- **Profile → Email address → Send verification email** verifies the current
+  address;
+- changing the address there sends the link to the new address; the old
+  address stays in use until the link is opened.
+
+Accounts created from an invitation that was emailed to them start out
+verified. When upgrading from a release without verification, only such
+addresses are marked verified; everyone else verifies once from the profile.
 
 ## Per-server permissions
 
@@ -57,8 +89,13 @@ apply immediately, including to pages the user already has open.
 | STOP | 2 | Stop and restart it — **includes START** |
 | CONSOLE_READ | 4 | View the console (snapshot and live) |
 | CONSOLE_WRITE | 8 | Send console commands — **includes CONSOLE_READ** |
-| BACKUPS | 16 | List, create and download backups |
-| CONFIG | 32 | Edit the server's name, description, category, timeouts and readiness text |
+| CONFIG | 32 | Edit the server's name, description, timeouts and readiness text |
+| BACKUP_CREATE | 64 | Start (and cancel) backups — does **not** show the backup files |
+| BACKUP_DOWNLOAD | 128 | List and download backup files — does **not** allow starting backups |
+
+Value 16 was the former general BACKUPS permission. The upgrade converted
+every grant of it into BACKUP_CREATE + BACKUP_DOWNLOAD, so nobody lost or
+gained anything; the API still accepts 16 and stores it the same way.
 
 The stored value is the sum of the ticked permissions (e.g. START +
 CONSOLE_READ = 5). Implied permissions are shown ticked and greyed out.
@@ -71,8 +108,78 @@ CONSOLE_READ = 5). Implied permissions are shown ticked and greyed out.
   settings, users or other servers, and it cannot change what a server
   executes ([security.md](security.md#the-config-permission)).
 - Deleting backup files is reserved for administrators unless the server's
-  definition sets `backup.allow_user_delete`.
+  definition sets `backup.allow_user_delete` (then BACKUP_DOWNLOAD holders may).
+- The category of a server is changed by administrators only: it decides
+  which concurrency limit applies.
 - Administrators always have everything.
+
+### Custom action permissions
+
+Custom actions (see below) are granted one by one, in the **Custom actions**
+part of the same editors. A user can run an action when they have *any*
+permission on the server (so they can see it) **and** a grant for that
+action. Nothing else implies an action: START, STOP or CONSOLE_WRITE do not,
+and an action grant gives nothing besides that action. This lets you allow,
+say, "Save World" to someone who may only read the console. Grants of a
+deleted action are removed with it.
+
+## Custom actions
+
+Administrators add actions to a server in its **Settings** tab (section
+*Custom actions*; saved with the other settings) or through the API. An
+action either runs a script/program with fixed arguments or types a fixed
+command into the server's tmux session. Options: icon, description,
+confirmation before running, timeout (scripts), enabled. The fields are
+described in [configuration.md](configuration.md#actions--custom-actions).
+
+Users see the actions they may run as small cards above the tabs of the
+server page, with the result of the last run (and, for scripts, their
+output). A script action reports *completed* or *failed*; a tmux action
+reports *sent*: the command reached the console, but whether the server did
+anything with it cannot be verified. An action runs at most once at a time
+per server; every run is in the audit log (`ACTION_RUN`) and the Activity
+tab.
+
+## Concurrency limits and categories
+
+The **Limits** page sets how many servers may be active at once — in total
+and per category — and manages the categories themselves (name, description,
+limit). Servers are assigned to a category in their Settings tab. Current
+usage is shown on the dashboard and updates live.
+
+- A server counts from the moment its start is accepted until it is
+  confirmed stopped. A server in ERROR or UNKNOWN keeps counting if it was
+  last seen running; servers started outside Server Manager count too.
+- A refused start explains which limit was reached and shows the current
+  usage. Administrators are limited as well, but can choose **Start anyway**;
+  that override is recorded in the audit log (`LIMIT_OVERRIDE`).
+- Limits only govern starts through Server Manager. Nothing is stopped
+  because a limit is exceeded (for example by servers started by hand).
+- Category names already used in server definitions appear under *Unmanaged
+  categories*; **Manage** turns one into a managed category, keeping its
+  servers.
+
+## Email notifications
+
+Users choose in their **Profile** whether they want emails when a server
+they can access becomes ready (after the readiness check), stops normally,
+stops unexpectedly or crashes, or when a start/stop fails — each type
+separately, and per server. Everything is off by default, and only verified
+addresses receive mail.
+
+- "Crashed" is used only with evidence (non-zero exit, failed unit,
+  container error); otherwise the email says the server stopped
+  unexpectedly. A crash never also produces a "stopped" email.
+- Reconciliation after Server Manager restarts, and temporary loss of
+  monitoring (UNKNOWN), do not produce emails.
+- Repeated events of the same kind for the same server are held back for
+  `notifications.cooldown` (default 10 minutes); the next email says how many
+  were suppressed. Each event is mailed at most once per person.
+- Sending happens in the background with retries; failures are logged
+  without addresses and never slow down server operations.
+- Removing someone's access to a server stops their notifications about it
+  immediately, including emails still waiting for a retry.
+- `notifications.enabled` (Settings) turns the feature off for everyone.
 
 ## Server states
 
@@ -120,9 +227,17 @@ recorded in the audit log with the user who sent it.
 
 ## Backups
 
-On the **Backups** tab, users with BACKUPS can list files, download them and
-— if a backup command is configured — start a backup. A running backup can be
-cancelled. The list refreshes by itself when a backup finishes.
+On the **Backups** tab, users with BACKUP_DOWNLOAD see and download the
+files, and users with BACKUP_CREATE start backups (if a backup command or a
+tmux backup command is configured). A running script backup can be
+cancelled. The list refreshes by itself when a backup finishes or new files
+appear.
+
+With the tmux method, **Create backup** types the configured command (for
+example `/backup start`) into the server console. Unless a completion
+pattern is configured, the operation is shown as *submitted* — the command
+was delivered, but the manager cannot know when the server has finished —
+and new backup files show up in the list as the server writes them.
 
 ## Audit log
 
@@ -134,7 +249,11 @@ attempts that were denied. Filter by user, server, action, result and time
 range.
 
 Results: `REQUESTED` (an operation was accepted), `SUCCESS`, `FAILURE`,
-`DENIED`.
+`DENIED`, `SUBMITTED` (a command was delivered to a tmux console; its effect
+cannot be verified). Also recorded: custom action runs and changes, action
+grants, category changes, concurrency limit refusals and overrides, email
+verification requests, notification preference changes, password reset
+requests (including refused ones, with the reason) and resets.
 
 The audit log lives in the database and is separate from the application log
 (stderr/journald, for troubleshooting) and from server console output.
@@ -182,5 +301,10 @@ Set `logging.level` to `debug` (Settings) for request-level detail.
 | Signed out immediately after signing in (behind a proxy) | `public_url` is `https://…` but the site is opened over plain HTTP, so the Secure cookie is not sent back. Use HTTPS. |
 | "Cross-origin request rejected" | The proxy does not pass the original `Host` header. Add `proxy_set_header Host $host;` (nginx). |
 | Invitation links point to the wrong address | Set `public_url`. |
+| "Forgot password?" is not shown | Email delivery is not configured, or `public_url` is missing (production). |
+| A user gets no reset email | The account is an administrator, disabled, or its address is not verified. The audit log (`PASSWORD_RESET_REQUEST`, `DENIED`) says which. |
+| No notification emails | The user has not opted in, the address is not verified, the server is muted, `notifications.enabled` is off, or SMTP is not configured. |
+| Start refused: *… reached its limit …* | A concurrency limit (Limits page). Stop another server, raise the limit, or override as an administrator. |
+| tmux backup or action: *tmux session … is not running* | The server's tmux session does not exist; start the server first. |
 | Settings cannot be saved | The service user cannot write `config.json`. |
 | All game servers stopped when the manager was restarted | The unit is missing `KillMode=process`. Use the provided unit file. |

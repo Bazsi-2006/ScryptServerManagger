@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/Bazsi-2006/ScryptServerManagger/internal/audit"
 	"github.com/Bazsi-2006/ScryptServerManagger/internal/backend"
+	backupfiles "github.com/Bazsi-2006/ScryptServerManagger/internal/backup"
 	"github.com/Bazsi-2006/ScryptServerManagger/internal/db"
 	"github.com/Bazsi-2006/ScryptServerManagger/internal/events"
 	"github.com/Bazsi-2006/ScryptServerManagger/internal/perm"
@@ -20,6 +22,9 @@ const (
 	statusFailed      = "failed"
 	statusCancelled   = "cancelled"
 	statusInterrupted = "interrupted"
+	// statusSubmitted: text was delivered to the server's console (tmux
+	// backups and actions); whether the server acted on it is unknown.
+	statusSubmitted = "submitted"
 )
 
 // result is what a lifecycle step reports back.
@@ -127,11 +132,13 @@ func (s *server) end(op *operation, r result) {
 	if info.Type != OpBackup {
 		s.unready = r.unready
 	}
+	prev := s.state
 	if r.state != "" && (s.state != r.state || s.message != r.message) {
 		s.setLocked(r.state, r.message)
 	} else {
 		s.publishStatusLocked() // the operation field changed
 	}
+	s.operationTransitionLocked(info, prev, r)
 	s.mu.Unlock()
 
 	now := time.Now()
@@ -146,7 +153,11 @@ func (s *server) end(op *operation, r result) {
 		details["message"] = r.note
 	}
 	evType, auditResult := "server.operation.completed", audit.Success
-	if r.status != statusSucceeded {
+	switch r.status {
+	case statusSucceeded:
+	case statusSubmitted:
+		auditResult = audit.Submitted
+	default:
 		evType, auditResult = "server.operation.failed", audit.Failure
 		details["outcome"] = r.status
 	}
@@ -154,7 +165,7 @@ func (s *server) end(op *operation, r result) {
 	s.m.publish(events.Event{Type: evType, Audience: events.AudienceServer, ServerID: s.id,
 		Data: map[string]any{"server_id": s.id, "operation": info, "status": r.status, "message": r.note}})
 	if info.Type == OpBackup {
-		s.m.publish(events.Event{Type: "server.backups.changed", Audience: events.AudienceServer, ServerID: s.id, Perm: perm.Backups,
+		s.m.publish(events.Event{Type: "server.backups.changed", Audience: events.AudienceServer, ServerID: s.id, Perm: perm.BackupDownload,
 			Data: map[string]any{"server_id": s.id}})
 	} else {
 		s.m.cooldown.Mark(s.id)
@@ -162,6 +173,30 @@ func (s *server) end(op *operation, r result) {
 	op.cancel()
 	close(op.done)
 	s.poke()
+}
+
+// operationTransitionLocked reports the lifecycle change an operation caused.
+func (s *server) operationTransitionLocked(info OpInfo, prev State, r result) {
+	t := Transition{From: prev, To: s.state, Operation: info.Type, Actor: info.User, Detail: r.note}
+	switch info.Type {
+	case OpStart, OpRestart:
+		switch {
+		case r.status == statusSucceeded && r.state == Running:
+			t.Kind = db.NotifyReady
+		case r.status == statusFailed:
+			t.Kind = db.NotifyFailure
+		}
+	case OpStop:
+		switch {
+		case r.status == statusSucceeded && r.state == Stopped:
+			t.Kind = db.NotifyStopped
+		case r.status == statusFailed:
+			t.Kind = db.NotifyFailure
+		}
+	}
+	if t.Kind != "" {
+		s.emitLocked(t)
+	}
 }
 
 func (s *server) snapshot() (*servers.Definition, backend.Backend) {
@@ -196,6 +231,12 @@ func (s *server) probeNow() (life, backend.Probe) {
 // StartServer begins starting a server and returns as soon as the operation has
 // been accepted; progress is reported through status and events.
 func (m *Manager) StartServer(id string, actor audit.Actor) (*OpInfo, error) {
+	return m.StartServerWith(id, actor, StartOptions{})
+}
+
+// StartServerWith is StartServer with options. The concurrency limits are
+// checked and a slot is reserved atomically before anything is executed.
+func (m *Manager) StartServerWith(id string, actor audit.Actor, opts StartOptions) (*OpInfo, error) {
 	s, err := m.get(id)
 	if err != nil {
 		return nil, err
@@ -215,6 +256,11 @@ func (m *Manager) StartServer(id string, actor audit.Actor) (*OpInfo, error) {
 		s.release(op)
 		s.poke()
 		return nil, ErrAlreadyRunning
+	}
+	if err := m.reserve(s, actor, opts); err != nil {
+		s.release(op)
+		s.poke()
+		return nil, err
 	}
 	s.launch(op)
 	go func() { s.end(op, s.doStart(op)) }()
@@ -250,6 +296,12 @@ func (m *Manager) StopServer(id string, actor audit.Actor) (*OpInfo, error) {
 // RestartServer restarts a running server (or starts a stopped one). Backends
 // with a native restart use it; others stop and then start.
 func (m *Manager) RestartServer(id string, actor audit.Actor) (*OpInfo, error) {
+	return m.RestartServerWith(id, actor, StartOptions{})
+}
+
+// RestartServerWith is RestartServer with options. A running server keeps
+// its slot through the restart; a stopped one needs a free slot.
+func (m *Manager) RestartServerWith(id string, actor audit.Actor, opts StartOptions) (*OpInfo, error) {
 	s, err := m.get(id)
 	if err != nil {
 		return nil, err
@@ -272,6 +324,13 @@ func (m *Manager) RestartServer(id string, actor audit.Actor) (*OpInfo, error) {
 		return nil, err
 	}
 	l, _ := s.probeNow()
+	if l != lifeAlive {
+		if err := m.reserve(s, actor, opts); err != nil {
+			s.release(op)
+			s.poke()
+			return nil, err
+		}
+	}
 	s.launch(op)
 	go func() {
 		if l != lifeAlive {
@@ -508,9 +567,16 @@ func (m *Manager) Backup(id string, actor audit.Actor) (*OpInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	def, _ := s.snapshot()
-	if def.Backup == nil || def.Backup.Command == nil {
+	def, be := s.snapshot()
+	if !def.Backup.CanCreate() {
 		return nil, fmt.Errorf("%w: no backup command is configured for this server", ErrUnsupported)
+	}
+	if def.Backup.Method == servers.MethodTmux {
+		// Check up front so the user gets the reason right away instead of
+		// a failed operation.
+		if err := s.requireTmuxTarget(be, "backup command"); err != nil {
+			return nil, err
+		}
 	}
 	op, err := s.begin(OpBackup, actor, false)
 	if err != nil {
@@ -520,12 +586,39 @@ func (m *Manager) Backup(id string, actor audit.Actor) (*OpInfo, error) {
 	s.mu.Lock()
 	s.publishStatusLocked()
 	s.mu.Unlock()
-	go func() { s.end(op, s.doBackup(op, def)) }()
+	go func() { s.end(op, s.doBackup(op, def, be)) }()
 	info := op.info
 	return &info, nil
 }
 
-func (s *server) doBackup(op *operation, def *servers.Definition) result {
+// requireTmuxTarget checks that predefined text can be typed into the
+// server's tmux session right now.
+func (s *server) requireTmuxTarget(be backend.Backend, what string) error {
+	if _, ok := be.(backend.TextSender); !ok {
+		return fmt.Errorf("%w: this server's backend cannot receive a %s", ErrUnsupported, what)
+	}
+	ctx, cancel := context.WithTimeout(s.ctx, 15*time.Second)
+	defer cancel()
+	switch p := be.Probe(ctx); p.Life {
+	case backend.LifeAlive:
+		return nil
+	case backend.LifeDead:
+		session := ""
+		s.mu.Lock()
+		if t := s.def.Tmux; t != nil {
+			session = t.Session
+		}
+		s.mu.Unlock()
+		return fmt.Errorf("%w: tmux session %q is not running, so the %s cannot be sent", ErrNotRunning, session, what)
+	default:
+		return fmt.Errorf("%w: %s", backend.ErrUnavailable, firstNonEmpty(p.Detail, "the tmux session cannot be reached"))
+	}
+}
+
+func (s *server) doBackup(op *operation, def *servers.Definition, be backend.Backend) result {
+	if def.Backup.Method == servers.MethodTmux {
+		return s.doTmuxBackup(op, def, be)
+	}
 	timeout := def.Timeouts.Backup.D()
 	ctx, cancel := context.WithTimeout(op.ctx, timeout)
 	defer cancel()
@@ -555,6 +648,110 @@ func (s *server) doBackup(op *operation, def *servers.Definition) result {
 		return result{status: statusFailed, note: note}
 	}
 	return result{status: statusSucceeded, note: "backup completed"}
+}
+
+// doTmuxBackup types the configured backup command into the server's tmux
+// pane. Delivery is not completion: without a completion pattern the result
+// is "submitted"; with one, the operation waits for that console line.
+func (s *server) doTmuxBackup(op *operation, def *servers.Definition, be backend.Backend) result {
+	b := def.Backup
+	ts, ok := be.(backend.TextSender)
+	if !ok {
+		return result{status: statusFailed, note: "this server's backend cannot receive a backup command"}
+	}
+	var matched <-chan struct{}
+	if b.Completion != nil {
+		// Watch before sending so a fast confirmation cannot be missed;
+		// output from earlier runs is never considered.
+		mt := newMatcher(s.buf, b.Completion)
+		defer mt.close()
+		matched = mt.C
+	}
+	baseline := ""
+	if b.Directory != "" {
+		baseline = dirSignature(b.Directory)
+	}
+	sctx, cancel := context.WithTimeout(op.ctx, 20*time.Second)
+	err := ts.SendText(sctx, b.Tmux.Text, b.Tmux.PressEnter())
+	cancel()
+	if err != nil {
+		if _, cancelled, intr := s.opFlags(op); intr {
+			return result{status: statusInterrupted, note: "server-manager is shutting down"}
+		} else if cancelled {
+			return result{status: statusCancelled, note: "the backup was cancelled"}
+		}
+		return result{status: statusFailed, note: "the backup command could not be sent: " + err.Error()}
+	}
+	timeout := def.Timeouts.Backup.D()
+	if b.Directory != "" {
+		s.watchBackupDir(b.Directory, baseline, timeout)
+	}
+	if matched == nil {
+		return result{status: statusSubmitted, note: "the backup command was sent to the tmux session; whether the backup has finished cannot be verified (new files appear in the list as soon as they are written)"}
+	}
+	t := time.NewTimer(timeout)
+	defer t.Stop()
+	select {
+	case <-matched:
+		return result{status: statusSucceeded, note: "backup completed (confirmed by the console output)"}
+	case <-op.ctx.Done():
+		if _, _, intr := s.opFlags(op); intr {
+			return result{status: statusInterrupted, note: "server-manager is shutting down"}
+		}
+		return result{status: statusCancelled, note: "stopped waiting for the completion message; the server may still finish the backup"}
+	case <-t.C:
+		return result{status: statusFailed, note: fmt.Sprintf("the backup command was sent, but the completion message did not appear within %s", timeout)}
+	}
+}
+
+// backupWatchInterval is how often a watched backup directory is checked.
+var backupWatchInterval = 2 * time.Second
+
+// watchBackupDir tells clients when files in the backup directory change
+// after a backup was requested whose completion cannot be observed
+// directly. It stops once the directory has been quiet for a minute after a
+// change, after maxWait, or when the server goes away.
+func (s *server) watchBackupDir(dir, baseline string, maxWait time.Duration) {
+	s.mu.Lock()
+	if s.stopWatch != nil {
+		s.stopWatch()
+	}
+	ctx, cancel := context.WithTimeout(s.ctx, maxWait)
+	s.stopWatch = cancel
+	s.mu.Unlock()
+	go func() {
+		defer cancel()
+		sig := baseline
+		var lastChange time.Time
+		t := time.NewTicker(backupWatchInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
+			if now := dirSignature(dir); now != sig {
+				sig, lastChange = now, time.Now()
+				s.m.NotifyBackupsChanged(s.id)
+			} else if !lastChange.IsZero() && time.Since(lastChange) > time.Minute {
+				return
+			}
+		}
+	}()
+}
+
+// dirSignature summarises the backup files (names, sizes, times).
+func dirSignature(dir string) string {
+	files, err := backupfiles.List(dir)
+	if err != nil {
+		return "unavailable"
+	}
+	var b strings.Builder
+	for _, f := range files {
+		fmt.Fprintf(&b, "%s|%d|%d\n", f.Name, f.Size, f.ModTime.UnixNano())
+	}
+	return b.String()
 }
 
 func tailLine(s string) string {

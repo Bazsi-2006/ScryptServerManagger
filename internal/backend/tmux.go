@@ -425,6 +425,40 @@ func (b *tmuxBackend) SendInput(ctx context.Context, line string) error {
 	return b.sendKeys(ctx, false, "Enter")
 }
 
+// SendText types predefined text into the configured pane (send-keys -l, so
+// key names and shell syntax are not interpreted), optionally followed by
+// Enter. The pane must exist and its process must still be alive.
+func (b *tmuxBackend) SendText(ctx context.Context, text string, enter bool) error {
+	for _, r := range text {
+		if unicode.IsControl(r) {
+			return errors.New("the text must not contain control characters")
+		}
+	}
+	if text == "" && !enter {
+		return errors.New("nothing to send")
+	}
+	info, err := b.paneInfo(ctx)
+	if err != nil {
+		return err
+	}
+	switch {
+	case !info.exists:
+		return fmt.Errorf("%w: tmux session %q does not exist", ErrNotRunning, b.t.Session)
+	case info.dead:
+		return fmt.Errorf("%w: the process in tmux session %q has exited", ErrNotRunning, b.t.Session)
+	}
+	b.ensurePipe(ctx, info)
+	if text != "" {
+		if err := b.sendKeys(ctx, true, text); err != nil {
+			return err
+		}
+	}
+	if enter {
+		return b.sendKeys(ctx, false, "Enter")
+	}
+	return nil
+}
+
 func (b *tmuxBackend) Close() {
 	b.cancel()
 	b.wg.Wait()

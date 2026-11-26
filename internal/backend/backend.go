@@ -112,6 +112,17 @@ type Backend interface {
 	Close()
 }
 
+// TextSender is implemented by backends that can type administrator-defined
+// text into the server's own console (tmux). It is independent of the
+// console input method users type into: it delivers fixed text configured
+// for backups and custom actions.
+type TextSender interface {
+	// SendText types text literally into the server's console, followed by
+	// the Enter key when enter is set. It fails with ErrNotRunning (wrapped
+	// with a description) when the target does not exist.
+	SendText(ctx context.Context, text string, enter bool) error
+}
+
 // Deps are the services a backend needs from its host.
 type Deps struct {
 	Config  *config.Holder

@@ -25,6 +25,7 @@ import (
 	"github.com/Bazsi-2006/ScryptServerManagger/internal/mail"
 	"github.com/Bazsi-2006/ScryptServerManagger/internal/manager"
 	"github.com/Bazsi-2006/ScryptServerManagger/internal/monitor"
+	"github.com/Bazsi-2006/ScryptServerManagger/internal/notify"
 	"github.com/Bazsi-2006/ScryptServerManagger/internal/servers"
 	"github.com/Bazsi-2006/ScryptServerManagger/web"
 )
@@ -36,14 +37,15 @@ func ValidUsername(name string) bool { return usernameRe.MatchString(name) }
 
 // App is a fully wired application instance.
 type App struct {
-	Config  *config.Holder
-	Store   *db.Store
-	Hub     *events.Hub
-	Manager *manager.Manager
-	Monitor *monitor.Monitor
-	API     *api.Server
-	Handler http.Handler
-	Log     *slog.Logger
+	Config   *config.Holder
+	Store    *db.Store
+	Hub      *events.Hub
+	Manager  *manager.Manager
+	Notifier *notify.Notifier
+	Monitor  *monitor.Monitor
+	API      *api.Server
+	Handler  http.Handler
+	Log      *slog.Logger
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -93,6 +95,9 @@ func Build(holder *config.Holder, log *slog.Logger, opts Options) (*App, error) 
 		log.Error("skipping invalid server definition", "file", name, "problem", problem)
 	}
 	a.Manager = manager.New(holder, defs, store, a.Hub, rec, log)
+	mailer := mail.New(holder, log)
+	a.Notifier = notify.New(holder, store, mailer, log)
+	a.Manager.SetTransitionHook(a.Notifier.Notify)
 
 	static := opts.Static
 	if static == nil && !opts.NoStatic {
@@ -104,7 +109,7 @@ func Build(holder *config.Holder, log *slog.Logger, opts Options) (*App, error) 
 	}
 	a.API, err = api.New(api.Deps{
 		Config: holder, Store: store, Manager: a.Manager, Hub: a.Hub, Signer: auth.NewSigner(key),
-		Mailer: mail.New(holder, log), Audit: rec, Monitor: a.Monitor, Log: log, Static: static,
+		Mailer: mailer, Audit: rec, Monitor: a.Monitor, Log: log, Static: static,
 		Version: opts.Version, SetLevel: opts.SetLevel,
 	})
 	if err != nil {
@@ -113,6 +118,7 @@ func Build(holder *config.Holder, log *slog.Logger, opts Options) (*App, error) 
 	}
 	a.Handler = a.API.Handler()
 
+	a.Notifier.Start()
 	a.Manager.Load()
 	go a.Hub.Run(a.ctx.Done(), time.Minute)
 	go a.Monitor.Run(a.ctx,
@@ -134,6 +140,12 @@ func (a *App) housekeeping() {
 		now := time.Now()
 		if err := a.Store.PurgeSessions(ctx, now.Add(-7*24*time.Hour)); err != nil {
 			a.Log.Warn("session cleanup failed", "error", err)
+		}
+		if err := a.Store.PurgePasswordResets(ctx, now.Add(-24*time.Hour)); err != nil {
+			a.Log.Warn("password reset cleanup failed", "error", err)
+		}
+		if err := a.Store.PurgeNotifications(ctx, now.Add(-90*24*time.Hour)); err != nil {
+			a.Log.Warn("notification log cleanup failed", "error", err)
 		}
 		if days := a.Config.Get().Audit.RetentionDays; days > 0 {
 			cutoff := now.Add(-time.Duration(days) * 24 * time.Hour)
@@ -163,6 +175,7 @@ func (a *App) housekeeping() {
 func (a *App) Close(ctx context.Context) {
 	a.Hub.Close()
 	a.Manager.Shutdown(ctx)
+	a.Notifier.Close()
 	a.cancel()
 	if err := a.Store.Close(); err != nil {
 		a.Log.Warn("closing database", "error", err)

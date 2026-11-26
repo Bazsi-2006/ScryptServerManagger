@@ -74,10 +74,12 @@ type Argon2 struct {
 }
 
 type Auth struct {
-	AccessTokenTTL    Duration `json:"access_token_ttl"`
-	RefreshTokenTTL   Duration `json:"refresh_token_ttl"`
-	InvitationTTL     Duration `json:"invitation_ttl"`
-	EmailChangeTTL    Duration `json:"email_change_ttl"`
+	AccessTokenTTL  Duration `json:"access_token_ttl"`
+	RefreshTokenTTL Duration `json:"refresh_token_ttl"`
+	InvitationTTL   Duration `json:"invitation_ttl"`
+	EmailChangeTTL  Duration `json:"email_change_ttl"`
+	// PasswordResetTTL is how long an emailed password reset link works.
+	PasswordResetTTL  Duration `json:"password_reset_ttl"`
 	MinPasswordLength int      `json:"min_password_length"`
 	// CookieSecure: "auto" (secure when public_url is https or the request
 	// arrived over TLS), "always" or "never".
@@ -110,13 +112,18 @@ type Rate struct {
 }
 
 type RateLimits struct {
-	Login          Rate     `json:"login"`
-	Refresh        Rate     `json:"refresh"`
-	API            Rate     `json:"api"`
-	ServerStart    Rate     `json:"server_start"`
-	ServerStop     Rate     `json:"server_stop"`
-	ConsoleCommand Rate     `json:"console_command"`
-	BackupCreate   Rate     `json:"backup_create"`
+	Login          Rate `json:"login"`
+	Refresh        Rate `json:"refresh"`
+	API            Rate `json:"api"`
+	ServerStart    Rate `json:"server_start"`
+	ServerStop     Rate `json:"server_stop"`
+	ConsoleCommand Rate `json:"console_command"`
+	BackupCreate   Rate `json:"backup_create"`
+	// ActionRun limits custom action runs per user and server.
+	ActionRun Rate `json:"action_run"`
+	// PasswordReset limits reset requests per client address and per email
+	// address, and reset attempts per address.
+	PasswordReset  Rate     `json:"password_reset"`
 	ServerCooldown Duration `json:"server_cooldown"`
 }
 
@@ -161,6 +168,34 @@ type Security struct {
 	MaxRequestBytes            int64 `json:"max_request_bytes"`
 }
 
+// Limits bounds how many servers may be active at the same time. A server
+// is active while it is starting, running or stopping, and stays counted
+// until it is confirmed to have stopped.
+type Limits struct {
+	// MaxConcurrentServers applies across all servers (0 = unlimited).
+	MaxConcurrentServers int `json:"max_concurrent_servers"`
+}
+
+// Category groups servers on the dashboard and can limit how many of its
+// servers may be active at once. Server definitions refer to a category by
+// its ID (older definitions by its name, which is matched case-insensitively).
+type Category struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	// MaxConcurrent is the per-category limit (0 = unlimited).
+	MaxConcurrent int `json:"max_concurrent"`
+}
+
+// Notifications configures the optional server activity emails.
+type Notifications struct {
+	// Enabled is the global switch; users still opt in individually.
+	Enabled bool `json:"enabled"`
+	// Cooldown suppresses repeated emails of the same kind about the same
+	// server (for example a server that keeps crashing).
+	Cooldown Duration `json:"cooldown"`
+}
+
 type Tools struct {
 	Tmux         string `json:"tmux"`
 	Systemctl    string `json:"systemctl"`
@@ -186,6 +221,10 @@ type Config struct {
 	Audit          Audit      `json:"audit"`
 	Security       Security   `json:"security"`
 	Tools          Tools      `json:"tools"`
+	Limits         Limits     `json:"limits"`
+	// Categories is the registry of managed server categories.
+	Categories    []Category    `json:"categories"`
+	Notifications Notifications `json:"notifications"`
 }
 
 func sec(n int) Duration { return Duration(time.Duration(n) * time.Second) }
@@ -203,6 +242,7 @@ func Default() *Config {
 			RefreshTokenTTL:   Duration(30 * 24 * time.Hour),
 			InvitationTTL:     Duration(72 * time.Hour),
 			EmailChangeTTL:    Duration(24 * time.Hour),
+			PasswordResetTTL:  Duration(time.Hour),
 			MinPasswordLength: 10,
 			CookieSecure:      "auto",
 			Argon2:            Argon2{MemoryKiB: 64 * 1024, Iterations: 3, Parallelism: 2},
@@ -216,6 +256,8 @@ func Default() *Config {
 			ServerStop:     Rate{Requests: 6, Window: sec(60)},
 			ConsoleCommand: Rate{Requests: 60, Window: sec(60)},
 			BackupCreate:   Rate{Requests: 3, Window: sec(300)},
+			ActionRun:      Rate{Requests: 20, Window: sec(60)},
+			PasswordReset:  Rate{Requests: 5, Window: sec(900)},
 			ServerCooldown: sec(3),
 		},
 		Monitoring: Monitoring{
@@ -238,6 +280,7 @@ func Default() *Config {
 			Tmux: "tmux", Systemctl: "systemctl", Journalctl: "journalctl", Sudo: "sudo",
 			DockerSocket: "/var/run/docker.sock",
 		},
+		Notifications: Notifications{Enabled: true, Cooldown: Duration(10 * time.Minute)},
 	}
 }
 
@@ -352,6 +395,9 @@ func (c *Config) Validate() error {
 	if a.EmailChangeTTL.D() < time.Minute || a.EmailChangeTTL.D() > 30*24*time.Hour {
 		add("auth.email_change_ttl must be between 1m and 30 days")
 	}
+	if a.PasswordResetTTL.D() < 5*time.Minute || a.PasswordResetTTL.D() > 24*time.Hour {
+		add("auth.password_reset_ttl must be between 5m and 24h")
+	}
 	if a.MinPasswordLength < 8 || a.MinPasswordLength > 128 {
 		add("auth.min_password_length must be between 8 and 128")
 	}
@@ -394,6 +440,8 @@ func (c *Config) Validate() error {
 	checkRate(&p, "server_stop", r.ServerStop)
 	checkRate(&p, "console_command", r.ConsoleCommand)
 	checkRate(&p, "backup_create", r.BackupCreate)
+	checkRate(&p, "action_run", r.ActionRun)
+	checkRate(&p, "password_reset", r.PasswordReset)
 	if r.ServerCooldown.D() < 0 || r.ServerCooldown.D() > time.Hour {
 		add("rate_limits.server_cooldown must be between 0s and 1h")
 	}
@@ -449,6 +497,13 @@ func (c *Config) Validate() error {
 	}
 	if c.Tools.DockerSocket == "" || !filepath.IsAbs(c.Tools.DockerSocket) {
 		add("tools.docker_socket must be an absolute path")
+	}
+	if c.Limits.MaxConcurrentServers < 0 || c.Limits.MaxConcurrentServers > 10000 {
+		add("limits.max_concurrent_servers must be between 0 (unlimited) and 10000")
+	}
+	p = append(p, ValidateCategories(c.Categories)...)
+	if c.Notifications.Cooldown.D() < 0 || c.Notifications.Cooldown.D() > 7*24*time.Hour {
+		add("notifications.cooldown must be between 0s and 168h")
 	}
 	if len(p) > 0 {
 		return &ValidationError{Problems: p}

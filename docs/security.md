@@ -7,8 +7,8 @@ states what it guarantees, how, and where the limits are.
 
 | Who | Can |
 |---|---|
-| Anyone on the network | Reach the login and invitation-registration pages. Nothing else. |
-| A user | See and operate only the servers they hold permissions for, within those permissions. |
+| Anyone on the network | Reach the login, invitation-registration and password-reset pages. Nothing else. |
+| A user | See and operate only the servers they hold permissions for, within those permissions, and run only the custom actions explicitly granted to them. |
 | An administrator | Everything in the application, including defining which commands run. **An administrator can execute arbitrary programs as the service user** — that is what configuring a server means. |
 | The service user (OS) | Whatever the operating system lets that account do. This is the outer boundary. |
 
@@ -38,15 +38,35 @@ and keep the service user unprivileged ([permissions.md](permissions.md)).
 - Helper commands run in their own process group and are killed as a group on
   timeout, so they cannot leave strays behind.
 
+### Custom actions
+
+Custom actions are privileged capabilities defined by administrators: an
+action runs exactly the executable and arguments (or types exactly the tmux
+text) its definition says. A run request names the action and may confirm
+it — nothing else; unknown fields are rejected, so users cannot add
+arguments or text. Script actions go through the same no-shell execution as
+every other command (own process group, killed on timeout, cleaned
+environment); tmux actions are typed with `send-keys -l` and refuse control
+characters. Only administrators can create or change actions; CONFIG holders
+do not even see them, and users only ever see an action's name, description
+and results, never its command. Running an action requires access to the
+server plus an explicit grant for that action; no other permission implies
+it. Each action runs at most once at a time per server and runs are rate
+limited and audited.
+
+As with CONSOLE_WRITE, a tmux action is as powerful as the text it types in
+the console it types it into.
+
 ### The CONFIG permission
 
 CONFIG lets a non-administrator edit a server's presentation and tuning:
-name, description, category, timeouts, cooldown, polling intervals and the
-console readiness pattern. It does **not** let them change the backend,
-commands, arguments, paths, environment, console input method or backup
-settings — the API rejects such changes with 403, because they would amount
-to arbitrary command execution. Environment values are masked when a
-non-administrator reads a configuration.
+name, description, timeouts, cooldown, polling intervals and the console
+readiness pattern. It does **not** let them change the backend, commands,
+arguments, paths, environment, console input method, backup settings or
+custom actions — the API rejects such changes with 403, because they would
+amount to arbitrary command execution — nor the category, which decides the
+concurrency limit. Environment values are masked and custom actions omitted
+when a non-administrator reads a configuration.
 
 `security.config_permission_full_access: true` removes that restriction. It
 exists for small trusted teams; turning it on makes every CONFIG holder
@@ -72,10 +92,26 @@ equivalent to an administrator of that server's commands.
   tabs) is treated as theft: the session is revoked and the event audited.
 - **Sessions** are tracked server-side; users can revoke their own,
   administrators anyone's. Changing a password revokes all other sessions.
-- **Invitation and verification tokens** are 256-bit random, stored hashed,
-  time-limited and single-use (enforced atomically in the database). Links
-  carry the token in the URL fragment, which browsers do not send to servers
-  or put in `Referer` headers. In production they never appear in logs.
+- **Invitation, verification and password reset tokens** are 256-bit
+  random, stored hashed, time-limited and single-use (enforced atomically in
+  the database). Links carry the token in the URL fragment, which browsers do
+  not send to servers or put in `Referer` headers. In production they never
+  appear in logs.
+- **Email password reset** is only available to regular, enabled accounts
+  with a **verified** address. Administrator accounts can never use it: no
+  link is issued for them, and eligibility (not an administrator, not
+  disabled, same verified address) is checked again when a link is redeemed,
+  so a link issued before a promotion is useless — promotion, a password
+  change and an address change also delete pending links. The request
+  endpoint gives the same answer, and does the same visible work, for
+  unknown addresses, administrators, ineligible and eligible accounts (the
+  lookup and the email happen in the background). Requests are rate limited
+  per client address and per email address. A successful reset revokes every
+  session of the account. Administrators recover through the command line on
+  the host (`server-manager user set-password`).
+- **Email verification**: an address is verified by opening a single-use
+  link sent to it. Addresses set by an administrator start unverified; while
+  an address change is pending, the old address stays in use.
 - **Login throttling** per client address and per account; unknown users and
   wrong passwords are indistinguishable in response and timing.
 
@@ -88,7 +124,8 @@ equivalent to an administrator of that server's commands.
 - A server the caller has no permission for returns 404 on every route, the
   same as a nonexistent one, so IDs cannot be enumerated.
 - Events are filtered per subscriber at delivery time. Console streams are
-  per server and require CONSOLE_READ. When permissions, accounts or sessions
+  per server and require CONSOLE_READ. Custom action results reach only
+  administrators and the users granted that action. When permissions, accounts or sessions
   change, open streams are re-validated immediately and closed if no longer
   allowed.
 - Users cannot change their own role or permissions. An administrator cannot
@@ -115,7 +152,7 @@ equivalent to an administrator of that server's commands.
   fields rejected), bounded console buffers and line lengths, slow stream
   consumers are disconnected rather than buffered.
 - **Rate limits and cooldowns** on sign-in, refresh, API use, server
-  start/stop, console commands and backups.
+  start/stop, console commands, backups, custom actions and password reset.
 - **Downloads**: an authorized API call mints a random ticket bound to one
   file, valid for 60 seconds and one request. No reusable credential ever
   appears in a URL. Files are opened through a directory handle that refuses
@@ -131,6 +168,9 @@ equivalent to an administrator of that server's commands.
   mode 0600; the service refuses a key file readable by others.
 - Passwords, tokens and environment values are never written to logs or the
   audit trail.
+- Notification emails go only to verified addresses of users who opted in
+  and may currently access the server (re-checked before every delivery
+  attempt). Delivery errors are logged with the user ID, never the address.
 
 ## Limitations you should know about
 

@@ -24,6 +24,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST "+v+"/auth/invitation", s.public(s.handleInvitationCheck))
 	mux.HandleFunc("POST "+v+"/auth/register", s.public(s.handleRegister))
 	mux.HandleFunc("POST "+v+"/auth/email/verify", s.public(s.handleVerifyEmail))
+	mux.HandleFunc("POST "+v+"/auth/password/forgot", s.public(s.handleForgotPassword))
+	mux.HandleFunc("POST "+v+"/auth/password/reset/check", s.public(s.handleCheckReset))
+	mux.HandleFunc("POST "+v+"/auth/password/reset", s.public(s.handleResetPassword))
 	mux.HandleFunc("GET "+v+"/downloads/{ticket}", s.public(s.handleDownload))
 
 	// Profile.
@@ -31,6 +34,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PATCH "+v+"/me", s.authed(s.handleUpdateMe))
 	mux.HandleFunc("POST "+v+"/me/password", s.authed(s.handleChangePassword))
 	mux.HandleFunc("POST "+v+"/me/email", s.authed(s.handleRequestEmailChange))
+	mux.HandleFunc("POST "+v+"/me/email/verification", s.authed(s.handleSendVerification))
+	mux.HandleFunc("GET "+v+"/me/notifications", s.authed(s.handleGetNotifications))
+	mux.HandleFunc("PUT "+v+"/me/notifications", s.authed(s.handlePutNotifications))
 	mux.HandleFunc("GET "+v+"/me/sessions", s.authed(s.handleMySessions))
 	mux.HandleFunc("DELETE "+v+"/me/sessions/{sid}", s.authed(s.handleRevokeMySession))
 	mux.HandleFunc("POST "+v+"/me/sessions/revoke-others", s.authed(s.handleRevokeOtherSessions))
@@ -38,6 +44,7 @@ func (s *Server) Handler() http.Handler {
 	// Real-time.
 	mux.HandleFunc("GET "+v+"/events", s.authed(s.handleEvents))
 	mux.HandleFunc("GET "+v+"/system/metrics", s.authed(s.handleMetrics))
+	mux.HandleFunc("GET "+v+"/capacity", s.authed(s.handleCapacity))
 
 	// Servers. Per-server authorization happens in each handler (access).
 	mux.HandleFunc("GET "+v+"/servers", s.authed(s.handleListServers))
@@ -61,6 +68,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE "+v+"/servers/{id}/backups/{name}", s.authed(s.handleDeleteBackup))
 	mux.HandleFunc("POST "+v+"/servers/{id}/backups/{name}/download", s.authed(s.handleDownloadTicket))
 	mux.HandleFunc("GET "+v+"/servers/{id}/permissions", s.admin(s.handleServerPermissions))
+	mux.HandleFunc("GET "+v+"/servers/{id}/actions", s.authed(s.handleListActions))
+	mux.HandleFunc("POST "+v+"/servers/{id}/actions", s.admin(s.handleCreateAction))
+	mux.HandleFunc("PUT "+v+"/servers/{id}/actions/{aid}", s.admin(s.handleUpdateAction))
+	mux.HandleFunc("DELETE "+v+"/servers/{id}/actions/{aid}", s.admin(s.handleDeleteAction))
+	mux.HandleFunc("POST "+v+"/servers/{id}/actions/{aid}/run", s.authed(s.handleRunAction))
 
 	// Administration.
 	mux.HandleFunc("GET "+v+"/admin/users", s.admin(s.handleListUsers))
@@ -68,6 +80,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PATCH "+v+"/admin/users/{uid}", s.admin(s.handleUpdateUser))
 	mux.HandleFunc("DELETE "+v+"/admin/users/{uid}", s.admin(s.handleDeleteUser))
 	mux.HandleFunc("PUT "+v+"/admin/users/{uid}/permissions/{id}", s.admin(s.handleSetPermission))
+	mux.HandleFunc("PUT "+v+"/admin/users/{uid}/actions/{id}/{aid}", s.admin(s.handleSetActionPermission))
 	mux.HandleFunc("DELETE "+v+"/admin/users/{uid}/sessions", s.admin(s.handleRevokeUserSessions))
 	mux.HandleFunc("DELETE "+v+"/admin/users/{uid}/sessions/{sid}", s.admin(s.handleRevokeUserSessions))
 	mux.HandleFunc("GET "+v+"/admin/invitations", s.admin(s.handleListInvitations))
@@ -79,6 +92,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT "+v+"/admin/settings", s.admin(s.handlePutSettings))
 	mux.HandleFunc("POST "+v+"/admin/settings/test-email", s.admin(s.handleTestEmail))
 	mux.HandleFunc("POST "+v+"/admin/servers/reload", s.admin(s.handleReloadServers))
+	mux.HandleFunc("GET "+v+"/admin/categories", s.admin(s.handleListCategories))
+	mux.HandleFunc("POST "+v+"/admin/categories", s.admin(s.handleCreateCategory))
+	mux.HandleFunc("PUT "+v+"/admin/categories/{cid}", s.admin(s.handleUpdateCategory))
+	mux.HandleFunc("DELETE "+v+"/admin/categories/{cid}", s.admin(s.handleDeleteCategory))
 
 	mux.HandleFunc("/", s.handleStatic)
 	return s.base(mux)
